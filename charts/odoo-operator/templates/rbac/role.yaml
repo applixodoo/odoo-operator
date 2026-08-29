@@ -65,6 +65,17 @@ rules:
     resources: ["volumesnapshots"]
     verbs: ["get", "list", "watch", "create", "delete"]
 
+  # CloudNativePG Clusters — read-only.  When spec.database.cluster names a
+  # Cluster in the instance's OWN namespace, the operator adopts it instead of
+  # looking the name up in its clusters.yaml Secret: it reads the Cluster only
+  # to confirm existence, then connects via the `<cluster>-rw` Service using
+  # the `<cluster>-app` Secret (already covered by the core secrets rule
+  # above).  No write verbs — the Cluster's lifecycle belongs to whoever
+  # created it.
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["get", "list", "watch"]
+
   # PersistentVolumes (for filestore StorageClass migration rebind)
   - apiGroups: [""]
     resources: ["persistentvolumes"]

@@ -42,7 +42,26 @@ spec:
             description: OdooInstance is the Schema for the odooinstances API.
             properties:
               adminPassword:
+                description: |-
+                  Odoo master password, in plaintext. Mutually exclusive with [`OdooInstanceSpec::admin_password_secret_ref`] — exactly one of the two must be set (enforced by CEL on the CRD and by the validating webhook).
+
+                  Still honoured exactly as before for every CR that sets it; it became `Option` only so the Secret-backed alternative could exist.
+                nullable: true
                 type: string
+              adminPasswordSecretRef:
+                description: Source the master password from a Secret instead of `adminPassword`. In this mode the rendered `odoo.conf` is stored in a Secret rather than a ConfigMap so the password is not left in a world-readable object.
+                nullable: true
+                properties:
+                  key:
+                    description: Key within that Secret holding the master password.
+                    type: string
+                  name:
+                    description: Name of the Secret, in the instance's own namespace.
+                    type: string
+                required:
+                - key
+                - name
+                type: object
               affinity:
                 description: Affinity is a group of affinity scheduling rules.
                 nullable: true
@@ -921,6 +940,54 @@ spec:
                     description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
                     type: object
                 type: object
+              runAsGroup:
+                description: '`runAsGroup` (and `fsGroup`) for every Odoo pod and job pod. Defaults to 101, the gid in the official Odoo image. `fsGroup` follows this value so the filestore PVC stays writable.'
+                format: int64
+                nullable: true
+                type: integer
+              runAsUser:
+                description: '`runAsUser` for every Odoo pod and job pod. Defaults to 100, the uid in the official Odoo image. Set this when the image runs Odoo as a different uid.'
+                format: int64
+                nullable: true
+                type: integer
+              sourceVolume:
+                description: Run Odoo from a source tree on an externally managed volume rather than from the image, using `python3 <odooBin>` in place of the official image's `/entrypoint.sh` convention. Absent = upstream behaviour.
+                nullable: true
+                properties:
+                  claimName:
+                    description: Name of the pre-existing PersistentVolumeClaim holding the source tree.
+                    type: string
+                  mounts:
+                    description: How to mount that claim. Must be non-empty.
+                    items:
+                      description: |-
+                        One mount of the [`SourceVolumeSpec`] claim into an Odoo container.
+
+                        The same claim is usually mounted more than once — the platform that owns the claim lays out both the Odoo checkouts and a `pip install --target` dependency tree on it, and the runtime has to reproduce the *absolute* paths the build step used (e.g. whole volume at `/work`, `subPath: build` at `/build`).
+                      properties:
+                        mountPath:
+                          description: Absolute path inside the container.
+                          type: string
+                        readOnly:
+                          default: false
+                          description: Mount read-only. Defaults to `false`.
+                          type: boolean
+                        subPath:
+                          description: Optional path *within* the volume to mount at `mountPath`.
+                          nullable: true
+                          type: string
+                      required:
+                      - mountPath
+                      type: object
+                    type: array
+                  odooBin:
+                    description: Absolute path to `odoo-bin` **as seen through `mounts`**.
+                    type: string
+                required:
+                - claimName
+                - mounts
+                - odooBin
+                type: object
               strategy:
                 description: StrategySpec defines the Deployment update strategy.
                 nullable: true
@@ -976,12 +1043,19 @@ spec:
                 - url
                 type: object
             required:
-            - adminPassword
             - ingress
             type: object
             x-kubernetes-validations:
             - messageExpression: '''spec.productionInstanceRef is forbidden on production instances'''
               rule: self.environment != 'Production' || !has(self.productionInstanceRef)
+            - messageExpression: '''exactly one of spec.adminPassword and spec.adminPasswordSecretRef must be set'''
+              rule: has(self.adminPassword) != has(self.adminPasswordSecretRef)
+            - messageExpression: '''spec.sourceVolume.mounts must not be empty'''
+              rule: '!has(self.sourceVolume) || size(self.sourceVolume.mounts) > 0'
+            - messageExpression: '''spec.sourceVolume.odooBin must be an absolute path'''
+              rule: '!has(self.sourceVolume) || self.sourceVolume.odooBin.startsWith(''/'')'
+            - messageExpression: '''spec.sourceVolume.mounts[].mountPath must be an absolute path'''
+              rule: '!has(self.sourceVolume) || self.sourceVolume.mounts.all(m, m.mountPath.startsWith(''/''))'
           status:
             description: OdooInstanceStatus defines the observed state of OdooInstance.
             nullable: true
