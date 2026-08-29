@@ -1,18 +1,14 @@
-name: Release Please
+name: Release
 
+# Tag-driven releases. Upstream drove this from release-please on master; this
+# fork tracks upstream rather than cutting conventional-commit releases, so the
+# trigger is an explicit `v*` tag instead.
 on:
   push:
-    branches: [master]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing git tag to (re)publish image and chart for, e.g. v1.10.6"
-        required: true
-        type: string
+    tags: ["v*"]
 
 permissions:
   contents: write
-  pull-requests: write
   packages: write
 
 env:
@@ -20,78 +16,37 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  release-please:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      - uses: googleapis/release-please-action@v4
-        id: release
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-
+  # Validate the tag shape before it reaches any shell or registry reference.
+  # Carried over from upstream's resolve-ref: a value that passes this regex
+  # contains no shell metacharacters, which is what makes the downstream
+  # `${{ needs.resolve-ref.outputs.tag_name }}` interpolations safe.
   resolve-ref:
     runs-on: ubuntu-latest
-    needs: release-please
-    if: |
-      always() &&
-      (
-        (github.event_name == 'push' && needs.release-please.outputs.release_created == 'true') ||
-        github.event_name == 'workflow_dispatch'
-      )
     outputs:
       tag_name: ${{ steps.pick.outputs.tag_name }}
     steps:
       - id: pick
-        # `inputs.tag` is carried via an env var (never inline `${{ }}` in the
-        # script text) and validated against a strict semver tag shape before
-        # use. This closes the script-injection vector (#136): a value that
-        # passes the regex contains no shell metacharacters, which also makes
-        # the downstream `${{ needs.resolve-ref.outputs.tag_name }}` uses safe.
         env:
-          DISPATCH_TAG: ${{ inputs.tag }}
+          PUSHED_TAG: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [[ ! "$DISPATCH_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-              echo "::error::invalid tag format: '$DISPATCH_TAG' (expected vMAJOR.MINOR.PATCH, e.g. v1.10.6)"
-              exit 1
-            fi
-            echo "tag_name=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag_name=${{ needs.release-please.outputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          if [[ ! "$PUSHED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::invalid tag format: '$PUSHED_TAG' (expected vMAJOR.MINOR.PATCH[-prerelease], e.g. v2.7.0-droggol.1)"
+            exit 1
           fi
+          echo "tag_name=$PUSHED_TAG" >> "$GITHUB_OUTPUT"
 
-  # Build each architecture on a native runner and push it by digest.
-  # The per-arch images are stitched into one manifest list by `merge`.
+  # Single-arch (linux/amd64) build, pushed by digest and then stitched into a
+  # manifest list by `merge`. The two-step push-by-digest + imagetools pattern
+  # is upstream's; it is kept even at one architecture so the published tag
+  # always resolves through a manifest list, and so adding arm64 back is a
+  # matrix entry rather than a rewrite.
   build-and-publish:
     needs: resolve-ref
-    # Explicit gate: the default success() is poisoned by the skipped
-    # release-please job upstream (GitHub propagates the skip past resolve-ref's
-    # always()), so on workflow_dispatch this job would skip even though
-    # resolve-ref succeeded. Run whenever resolve-ref produced a tag.
-    if: ${{ !cancelled() && needs.resolve-ref.outputs.tag_name != '' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.resolve-ref.outputs.tag_name }}
-
-      - name: Prepare platform name
-        run: echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
-        env:
-          platform: ${{ matrix.platform }}
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -114,7 +69,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
@@ -129,16 +84,14 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}
+          name: digests-linux-amd64
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
-  # Assemble the per-arch digests into one multi-arch manifest list.
   merge:
     runs-on: ubuntu-latest
     needs: [resolve-ref, build-and-publish]
-    if: ${{ !cancelled() && needs.resolve-ref.outputs.tag_name != '' && needs.build-and-publish.result == 'success' }}
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -163,7 +116,6 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
             type=raw,value=${{ needs.resolve-ref.outputs.tag_name }}
 
       - name: Create manifest list and push
@@ -173,15 +125,30 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
 
-      - name: Inspect image
+      # The manifest-list digest is the only immutable handle on what was
+      # published, and it is what a downstream deployment should pin. Surfaced
+      # in the job summary so it does not have to be dug out of the logs.
+      - name: Inspect image and report digest
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-ref.outputs.tag_name }}
         run: |
-          docker buildx imagetools inspect \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-ref.outputs.tag_name }}
+          docker buildx imagetools inspect "$IMAGE_REF"
+          # The manifest-list digest is sha256 over the raw manifest bytes.
+          DIGEST="sha256:$(docker buildx imagetools inspect "$IMAGE_REF" --raw | sha256sum | cut -d' ' -f1)"
+          {
+            echo "## Published image"
+            echo
+            echo '```'
+            echo "$IMAGE_REF"
+            echo "$IMAGE_REF@$DIGEST"
+            echo '```'
+            echo
+            echo "**Manifest digest:** \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release-chart:
     runs-on: ubuntu-latest
     needs: [resolve-ref, merge]
-    if: ${{ !cancelled() && needs.resolve-ref.outputs.tag_name != '' && needs.merge.result == 'success' }}
     permissions:
       contents: write
       packages: write

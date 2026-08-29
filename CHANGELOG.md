@@ -1,5 +1,61 @@
 # Changelog
 
+## 2.7.0-droggol.1
+
+First release of the **droggol fork**, branched from upstream `v2.6.0`. The
+fork exists so a managed-Odoo platform can drive the operator with images and
+PostgreSQL clusters it provisions itself. Everything below is additive and
+opt-in: with none of the new spec fields set, the operator's behaviour is
+byte-identical to upstream 2.6.0.
+
+Release engineering also changed: release-please is gone (this fork tracks
+upstream rather than cutting conventional-commit releases) and releases are
+driven by pushing a `v*` tag, which builds a `linux/amd64` image and publishes
+the chart. CI additionally runs on pushes to `droggol`.
+
+### Features
+
+* **crd:** `spec.sourceVolume` — run Odoo from a source tree on an externally
+  managed PVC instead of from the image. The operator mounts the claim at every
+  declared `mountPath` (optionally via `subPath`) and replaces the official
+  image's `/entrypoint.sh odoo …` convention with
+  `python3 <odooBin> -c /etc/odoo/odoo.conf …` in every container that executes
+  Odoo: the web and cron Deployments and the Odoo steps of the init, upgrade,
+  staging-refresh and neutralize jobs. Tooling containers (the `mc` uploader,
+  the pg-client and rsync steps) are deliberately untouched. The `-c` is what
+  replaces the entrypoint's own contribution — the official image supplies the
+  config file's location through `ODOO_RC`, which bypassing the entrypoint also
+  bypasses.
+* **crd:** `spec.runAsUser` / `spec.runAsGroup` — parameterise the pod security
+  context, which was hardcoded to the official image's uid 100 / gid 101. Those
+  remain the defaults, and `fsGroup` follows `runAsGroup` so the filestore stays
+  writable.
+* **crd:** `spec.adminPasswordSecretRef` — source the Odoo master password from
+  a Secret. `spec.adminPassword` becomes optional and exactly one of the two
+  must be set, enforced by a CEL rule on the CRD (covering CREATE, which the
+  UPDATE-only validating webhook cannot) and by the webhook. In this mode the
+  rendered `odoo.conf` moves from the ConfigMap to a same-named Secret, so the
+  master password is never left in a world-readable object.
+* **postgres:** adopt a namespaced CloudNativePG cluster. When
+  `spec.database.cluster` names a `postgresql.cnpg.io/v1` Cluster in the
+  instance's *own* namespace, the operator connects through the `<cluster>-rw`
+  Service using the `<cluster>-app` Secret and treats the database and its
+  owning role as pre-existing — no role creation, no database creation, and no
+  role deletion on teardown. This removes the previous requirement to register
+  every tenant cluster as a key in the operator's `clusters.yaml` Secret and to
+  hand-grant `CREATEDB CREATEROLE` on the tenant primary. Extension ensuring
+  (`pg_trgm` / `unaccent`) runs as the app user, which owns the database and can
+  create both trusted extensions. When no such Cluster exists the clusters.yaml
+  path is used exactly as before.
+
+### Notes
+
+* New RBAC: `get`/`list`/`watch` on `postgresql.cnpg.io` `clusters`. Secret
+  access was already granted.
+* `neutralize.sh` and `restore-neutralize.sh` now invoke `${ODOO_CMD:-odoo}`;
+  with the variable unset — i.e. whenever `spec.sourceVolume` is absent — this
+  is exactly the previous bare `odoo`.
+
 ## [2.6.0](https://github.com/bemade/odoo-operator/compare/v2.5.0...v2.6.0) (2026-08-14)
 
 
