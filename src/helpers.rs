@@ -101,6 +101,14 @@ pub fn sha256_hex(input: &str) -> String {
 // ── odoo.conf generation ──────────────────────────────────────────────────────
 
 /// Build the content of odoo.conf.
+///
+/// `prepend_std_addons` controls whether the official Odoo Docker image's own
+/// addon directories are prefixed onto `addons_path`. They must be, and always
+/// were, for an image built the stock way. They must *not* be when the Odoo
+/// source comes from `spec.sourceVolume`: that image is a toolchain, it does
+/// not ship Odoo, so `/opt/odoo/addons` and `/opt/odoo/odoo/addons` simply do
+/// not exist and naming them leaves dead entries in `addons_path`.
+#[allow(clippy::too_many_arguments)]
 pub fn build_odoo_conf(
     username: &str,
     password: &str,
@@ -109,6 +117,7 @@ pub fn build_odoo_conf(
     db_port: i32,
     db_name: &str,
     extra: &Option<BTreeMap<String, String>>,
+    prepend_std_addons: bool,
 ) -> String {
     let mut options = BTreeMap::new();
     options.insert("data_dir", "/var/lib/odoo".to_string());
@@ -137,12 +146,14 @@ pub fn build_odoo_conf(
     }
 
     // Prepend standard Odoo Docker image addon paths.
-    let std_addons = "/opt/odoo/addons,/opt/odoo/odoo/addons";
-    let ap = options.get("addons_path").cloned().unwrap_or_default();
-    if ap.is_empty() {
-        options.insert("addons_path", std_addons.to_string());
-    } else {
-        options.insert("addons_path", format!("{std_addons},{ap}"));
+    if prepend_std_addons {
+        let std_addons = "/opt/odoo/addons,/opt/odoo/odoo/addons";
+        let ap = options.get("addons_path").cloned().unwrap_or_default();
+        if ap.is_empty() {
+            options.insert("addons_path", std_addons.to_string());
+        } else {
+            options.insert("addons_path", format!("{std_addons},{ap}"));
+        }
     }
 
     // Write standard keys in a stable order, then remaining sorted.

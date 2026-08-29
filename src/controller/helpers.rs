@@ -277,28 +277,79 @@ pub fn odoo_command(instance: &OdooInstance, args: &[&str]) -> Vec<String> {
     cmd
 }
 
+/// Single-quote a word for safe interpolation into a `sh -c` program.
+///
+/// Only used where the operator builds shell *source*; argv vectors never go
+/// through this, since there is no shell to re-parse them.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The executable part of the Odoo invocation, as shell source — *without* the
+/// `-c` flag.
+///
+/// The `-c <conf>` flag is deliberately NOT part of this, and is carried by a
+/// separate `ODOO_CONF_ARG` (see [`odoo_cmd_env`]), because Odoo's CLI
+/// dispatcher only treats the first argument as a subcommand when it does not
+/// start with `-` (`odoo/cli/command.py`). Folding `-c <conf>` in here would
+/// make `$ODOO_CMD neutralize …` expand to
+/// `python3 odoo-bin -c … neutralize …`, where the dispatcher sees `-c`,
+/// silently falls back to the `server` command, and runs a *server* instead of
+/// neutralizing.
+pub fn odoo_shell_executable(instance: &OdooInstance) -> String {
+    match instance.spec.source_volume.as_ref() {
+        None => "odoo".to_string(),
+        Some(sv) => format!("python3 {}", shell_quote(&sv.odoo_bin)),
+    }
+}
+
 /// A shell word-list that runs Odoo *without* the image entrypoint wrapper.
 ///
 /// Used where the goal is to interrogate the binary rather than start a
 /// server — the entrypoint would otherwise block on `wait-for-psql.py` first.
 /// Matches the bare `odoo` upstream used for exactly that purpose.
 pub fn odoo_probe_command(instance: &OdooInstance) -> String {
+    odoo_shell_executable(instance)
+}
+
+/// [`odoo_entrypoint`] as shell source, for the one `sh -c` step that `exec`s
+/// the *server* rather than a subcommand (the demo-data init path).
+///
+/// No subcommand is involved, so `-c` leading the arguments is correct here —
+/// the dispatcher's fallback to `server` is exactly what that step wants.
+/// Paths are quoted, unlike the [`odoo_cmd_env`] variables, because this string
+/// really is parsed by a shell.
+pub fn odoo_entrypoint_shell(instance: &OdooInstance) -> String {
     match instance.spec.source_volume.as_ref() {
-        None => "odoo".to_string(),
-        Some(sv) => format!("python3 {}", sv.odoo_bin),
+        None => "/entrypoint.sh odoo".to_string(),
+        Some(sv) => format!(
+            "python3 {} -c {}",
+            shell_quote(&sv.odoo_bin),
+            shell_quote(ODOO_CONF_PATH)
+        ),
     }
 }
 
-/// `ODOO_CMD` for the shell scripts that shell out to Odoo (`neutralize.sh`,
-/// `restore-neutralize.sh`).
+/// `ODOO_CMD` / `ODOO_CONF_ARG` for the shell scripts that shell out to Odoo
+/// (`neutralize.sh`, `restore-neutralize.sh`).
 ///
-/// Empty when `spec.sourceVolume` is unset: the scripts fall back to
-/// `${ODOO_CMD:-odoo}`, i.e. exactly the bare `odoo` they used before.
+/// Both are empty when `spec.sourceVolume` is unset, so
+/// `${ODOO_CMD:-odoo} neutralize ${ODOO_CONF_ARG:-} …` expands to exactly the
+/// bare `odoo neutralize …` those scripts ran before — an unquoted empty
+/// expansion contributes no word at all.
+///
+/// Deliberately *not* shell-quoted: the value is word-split by the shell on
+/// expansion and quotes are not re-processed, so an embedded `'` would reach
+/// Odoo literally. `spec.sourceVolume.odooBin` is therefore constrained by CEL
+/// to contain no whitespace.
 pub fn odoo_cmd_env(instance: &OdooInstance) -> Vec<EnvVar> {
-    if instance.spec.source_volume.is_none() {
+    let Some(sv) = instance.spec.source_volume.as_ref() else {
         return vec![];
-    }
-    vec![env("ODOO_CMD", odoo_entrypoint(instance).join(" "))]
+    };
+    vec![
+        env("ODOO_CMD", format!("python3 {}", sv.odoo_bin)),
+        env("ODOO_CONF_ARG", format!("-c {ODOO_CONF_PATH}")),
+    ]
 }
 
 /// Build the `imagePullSecrets` list from an OdooInstance spec.

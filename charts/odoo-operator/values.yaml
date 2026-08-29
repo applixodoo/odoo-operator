@@ -4,8 +4,13 @@
 
 # Operator deployment configuration
 operator:
-  # Operator container image (include the tag, e.g. registry.bemade.org/bemade/odoo-operator:v0.12.0)
-  image: ghcr.io/bemade/odoo-operator
+  # Operator container image, including the tag.
+  #
+  # Left unset it resolves to ghcr.io/applixodoo/odoo-operator:v<appVersion>,
+  # i.e. the image this chart revision was released with — never a floating
+  # `:latest`, which would silently pair a chart with an operator built from a
+  # different schema. Override only to pin a different build or registry.
+  image: ""
   # Resource limits and requests for the operator
   resources:
     requests:

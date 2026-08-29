@@ -603,6 +603,9 @@ pub async fn ensure_config_map(
     let (username, password) = read_odoo_credentials(client, ns, name).await?;
 
     let admin_password = resolve_admin_password(client, ns, instance).await?;
+    // A source-volume image is a toolchain, not a stock Odoo image: it has no
+    // /opt/odoo/... addon directories to prepend.
+    let prepend_std_addons = instance.spec.source_volume.is_none();
     let conf_with_admin = build_odoo_conf(
         &username,
         &password,
@@ -611,6 +614,7 @@ pub async fn ensure_config_map(
         pg.port,
         &db,
         &instance.spec.config_options,
+        prepend_std_addons,
     );
 
     let in_secret = odoo_conf_in_secret(instance);
@@ -625,6 +629,7 @@ pub async fn ensure_config_map(
             pg.port,
             &db,
             &instance.spec.config_options,
+            prepend_std_addons,
         )
     } else {
         conf_with_admin.clone()

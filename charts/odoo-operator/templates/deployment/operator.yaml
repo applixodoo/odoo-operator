@@ -31,7 +31,7 @@ spec:
       serviceAccountName: odoo-operator
       containers:
         - name: {{ .Release.Name }}
-          image: {{ .Values.operator.image }}
+          image: {{ .Values.operator.image | default (printf "ghcr.io/applixodoo/odoo-operator:v%s" .Chart.AppVersion) }}
           imagePullPolicy: {{ .Values.operator.imagePullPolicy | default "Always" }}
           args:
             - --postgres-clusters-secret={{ .Values.postgresClustersSecretRef.name }}

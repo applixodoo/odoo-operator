@@ -68,7 +68,22 @@ pub struct SourceVolumeMount {
 /// exports `ODOO_RC` pointing there, and bypassing the entrypoint also
 /// bypasses that, so the config file (which carries `addons_path`, `db_host`,
 /// `db_user`, `db_password`, …) has to be named explicitly or Odoo starts
-/// with nothing but defaults.
+/// with nothing but defaults. Where a *subcommand* is involved (`odoo
+/// neutralize`) the flag must follow it: Odoo's CLI dispatcher only reads a
+/// subcommand from the first argument when that argument does not start with
+/// `-`, so a leading `-c` makes it silently run a server instead.
+///
+/// In this mode `addons_path` is exactly what `configOptions.addons_path`
+/// says — the official image's `/opt/odoo/...` defaults are *not* prepended,
+/// because a toolchain image does not ship Odoo's source.
+///
+/// The operator does not put the dependency tree on `PYTHONPATH` for you.
+/// Everything that runs Python in this mode — Odoo itself, the cron pod's exec
+/// probes (`scripts/cron_*_probe.py`) and any Odoo-adjacent tooling — resolves
+/// its imports from the image's own site-packages plus whatever `spec.extraEnv`
+/// sets, which is where the platform passes `PYTHONPATH=/build`. An image
+/// without the probes' dependencies, or a CR that omits that `extraEnv`, will
+/// fail at run time rather than at admission.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceVolumeSpec {
@@ -89,6 +104,15 @@ pub struct SourceVolumeSpec {
 /// When the ref is used the rendered `odoo.conf` is written to a **Secret**
 /// rather than the usual ConfigMap, so the master password never lands in a
 /// world-readable object — see `child_resources::ensure_config_map`.
+///
+/// Two edges worth knowing:
+///
+///   * The CEL XOR tests field *presence*, so an explicit `adminPassword: null`
+///     alongside a ref passes admission and then fails at render time with an
+///     explicit error. Writing an explicit null is the only way to hit this.
+///   * Switching back from a ref to a plaintext `adminPassword` stops the pods
+///     mounting the odoo.conf Secret, but does not delete it; its
+///     ownerReference reaps it when the instance is deleted.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminPasswordSecretRef {
@@ -130,6 +154,25 @@ pub enum DatabaseMissingPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct DatabaseSpec {
+    /// Which PostgreSQL cluster to use.
+    ///
+    /// Resolved in two steps, and the order is deliberate: a
+    /// `postgresql.cnpg.io/v1` Cluster of this name in the instance's **own
+    /// namespace** wins, and only if none exists is the name looked up as a
+    /// key in the operator's `clusters.yaml` Secret. A namespaced Cluster
+    /// therefore *shadows* a same-named clusters.yaml entry — intentional, so a
+    /// tenant's own database is never silently overridden by a global name,
+    /// but worth knowing when picking cluster names.
+    ///
+    /// Only a genuine 404 counts as "no such Cluster". Any other error from
+    /// that lookup (notably a 403 from missing RBAC) fails the reconcile rather
+    /// than falling through to clusters.yaml, since falling through would point
+    /// the instance at an entirely different database.
+    ///
+    /// A namespaced Cluster is *adopted*: its database and owning role are
+    /// assumed to exist already, and the operator neither creates nor drops
+    /// them. Migrating an instance INTO an adopted cluster is not supported —
+    /// the migration path runs `createdb`, which the app role cannot do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,6 +449,14 @@ fn default_init_modules() -> Vec<String> {
     )
         .message(Message::Expression(
             "'spec.sourceVolume.mounts[].mountPath must be an absolute path'".into()
+        )),
+    // `odooBin` reaches the neutralize scripts through an environment variable
+    // that the shell word-splits on expansion. Quoting it there is impossible
+    // (expansion does not re-process quotes), so a path containing whitespace
+    // would silently split into two arguments. Reject it at admission instead.
+    rule = Rule::new("!has(self.sourceVolume) || !self.sourceVolume.odooBin.contains(' ')")
+        .message(Message::Expression(
+            "'spec.sourceVolume.odooBin must not contain whitespace'".into()
         ))
 )]
 #[kube(

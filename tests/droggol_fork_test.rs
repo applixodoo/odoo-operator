@@ -164,9 +164,10 @@ fn probe_command_bypasses_the_entrypoint_wrapper() {
     // `odoo --version` must reach the binary directly — behind the image
     // entrypoint it would block on wait-for-psql.py first.
     assert_eq!(odoo_probe_command(&base_instance("prod")), "odoo");
+    // Shell source, so the path is quoted.
     assert_eq!(
         odoo_probe_command(&with_source_volume(base_instance("prod"))),
-        "python3 /work/instances/prod/odoo/odoo-bin"
+        "python3 '/work/instances/prod/odoo/odoo-bin'"
     );
 }
 
@@ -178,13 +179,111 @@ fn odoo_cmd_env_is_empty_without_a_source_volume() {
 }
 
 #[test]
-fn odoo_cmd_env_carries_the_full_invocation_when_sourced() {
+fn odoo_cmd_env_keeps_the_config_flag_out_of_the_executable() {
+    // The split is the whole point: Odoo's dispatcher only reads a subcommand
+    // from the first argument when it does not start with `-`, so `-c` must
+    // never precede `neutralize`.
     let envs = odoo_cmd_env(&with_source_volume(base_instance("prod")));
-    assert_eq!(envs.len(), 1);
-    assert_eq!(envs[0].name, "ODOO_CMD");
+    let get = |k: &str| {
+        envs.iter()
+            .find(|e| e.name == k)
+            .and_then(|e| e.value.clone())
+            .unwrap_or_else(|| panic!("{k} not set"))
+    };
     assert_eq!(
-        envs[0].value.as_deref(),
-        Some("python3 /work/instances/prod/odoo/odoo-bin -c /etc/odoo/odoo.conf")
+        get("ODOO_CMD"),
+        "python3 /work/instances/prod/odoo/odoo-bin"
+    );
+    assert!(
+        !get("ODOO_CMD").contains("-c"),
+        "the config flag must not be baked into ODOO_CMD"
+    );
+    assert_eq!(get("ODOO_CONF_ARG"), "-c /etc/odoo/odoo.conf");
+}
+
+// ── Neutralize invocation grammar (expanded by a real shell) ────────────────
+
+/// The exact invocation line both neutralize scripts use. Asserted to appear
+/// verbatim in each script so this test cannot drift away from what ships.
+const NEUTRALIZE_INVOCATION: &str = "${ODOO_CMD:-odoo} neutralize ${ODOO_CONF_ARG:-}";
+
+/// Expand `NEUTRALIZE_INVOCATION` through `/bin/sh` with the given environment
+/// and return the resulting argv words.
+///
+/// Word-splitting is the thing under test — asserting on the env strings alone
+/// would not catch a quoting or ordering mistake — so this runs the real shell
+/// rather than reimplementing its rules.
+fn expand_neutralize_argv(env: &[(&str, &str)]) -> Vec<String> {
+    let script = format!("printf '%s\\n' {NEUTRALIZE_INVOCATION} --db_host h -d db");
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(&script).env_clear();
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("sh should run");
+    assert!(out.status.success(), "sh failed: {out:?}");
+    String::from_utf8(out.stdout)
+        .expect("utf8")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn neutralize_invocation_line_is_the_one_the_scripts_ship() {
+    for path in ["scripts/neutralize.sh", "scripts/restore-neutralize.sh"] {
+        let body = std::fs::read_to_string(path).expect("script readable");
+        assert!(
+            body.contains(NEUTRALIZE_INVOCATION),
+            "{path} no longer contains the invocation this test pins"
+        );
+    }
+}
+
+#[test]
+fn neutralize_argv_without_source_volume_is_exactly_upstream() {
+    let argv = expand_neutralize_argv(&[]);
+    assert_eq!(
+        argv,
+        vec!["odoo", "neutralize", "--db_host", "h", "-d", "db"],
+        "unset mode must expand to upstream's bare `odoo neutralize …`"
+    );
+}
+
+#[test]
+fn neutralize_argv_puts_the_subcommand_immediately_after_the_executable() {
+    let inst = with_source_volume(base_instance("prod"));
+    let envs = odoo_cmd_env(&inst);
+    let pairs: Vec<(&str, String)> = envs
+        .iter()
+        .map(|e| (e.name.as_str(), e.value.clone().unwrap_or_default()))
+        .collect();
+    let borrowed: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let argv = expand_neutralize_argv(&borrowed);
+
+    assert_eq!(
+        argv,
+        vec![
+            "python3",
+            "/work/instances/prod/odoo/odoo-bin",
+            "neutralize",
+            "-c",
+            "/etc/odoo/odoo.conf",
+            "--db_host",
+            "h",
+            "-d",
+            "db",
+        ]
+    );
+    // The grammar assertion proper: whatever the executable expands to, the
+    // subcommand is the very next word, and no flag precedes it.
+    let sub = argv
+        .iter()
+        .position(|w| w == "neutralize")
+        .expect("subcommand present");
+    assert!(
+        !argv[..sub].iter().any(|w| w.starts_with('-')),
+        "no flag may precede the subcommand, or Odoo dispatches `server`: {argv:?}"
     );
 }
 
@@ -249,19 +348,66 @@ fn init_job_demo_script_without_source_volume_is_byte_identical_to_upstream() {
 fn init_job_demo_script_substitutes_both_invocations_when_sourced() {
     let (_, args) = init_container_command(&with_source_volume(base_instance("prod")), true);
     let script = &args[0];
-    // The probe is the bare binary...
+    // Paths are single-quoted: this string is parsed by a shell.
     assert!(
-        script.contains("maj=$(python3 /work/instances/prod/odoo/odoo-bin --version"),
-        "version probe must not go through an entrypoint: {script}"
+        script.contains("maj=$(python3 '/work/instances/prod/odoo/odoo-bin' --version"),
+        "version probe must not go through an entrypoint, and must quote the path: {script}"
     );
-    // ...while the real run carries the config file.
     assert!(
         script.contains(
-            "exec python3 /work/instances/prod/odoo/odoo-bin -c /etc/odoo/odoo.conf \"$@\" $flag"
+            "exec python3 '/work/instances/prod/odoo/odoo-bin' -c '/etc/odoo/odoo.conf' \"$@\" $flag"
         ),
-        "exec must use the full launch command: {script}"
+        "exec must use the full launch command with quoted paths: {script}"
     );
     assert!(!script.contains("/entrypoint.sh"));
+}
+
+#[test]
+fn demo_script_quoting_survives_a_path_needing_it() {
+    // CEL forbids whitespace in odooBin, but quoting still has to be correct
+    // for the other characters a shell would otherwise treat specially.
+    let mut inst = with_source_volume(base_instance("prod"));
+    inst.spec.source_volume.as_mut().unwrap().odoo_bin = "/work/it's/odoo-bin".to_string();
+    let (_, args) = init_container_command(&inst, true);
+    assert!(
+        args[0].contains(r"'/work/it'\''s/odoo-bin'"),
+        "single quotes in the path must be escaped: {}",
+        args[0]
+    );
+}
+
+// ── addons_path: the image's own directories ────────────────────────────────
+
+#[test]
+fn addons_path_prepends_the_image_defaults_without_a_source_volume() {
+    let extra = Some(std::collections::BTreeMap::from([(
+        "addons_path".to_string(),
+        "/mnt/extra-addons".to_string(),
+    )]));
+    let conf = odoo_operator::helpers::build_odoo_conf("u", "p", "a", "h", 5432, "d", &extra, true);
+    assert!(
+        conf.contains("addons_path = /opt/odoo/addons,/opt/odoo/odoo/addons,/mnt/extra-addons\n"),
+        "stock images must keep the prepend: {conf}"
+    );
+}
+
+#[test]
+fn addons_path_is_verbatim_with_a_source_volume() {
+    // A toolchain image does not ship Odoo, so /opt/odoo/... does not exist
+    // and naming it would leave dead entries in addons_path.
+    let extra = Some(std::collections::BTreeMap::from([(
+        "addons_path".to_string(),
+        "/work/instances/prod/odoo/addons,/work/instances/prod/enterprise".to_string(),
+    )]));
+    let conf =
+        odoo_operator::helpers::build_odoo_conf("u", "p", "a", "h", 5432, "d", &extra, false);
+    assert!(
+        conf.contains(
+            "addons_path = /work/instances/prod/odoo/addons,/work/instances/prod/enterprise\n"
+        ),
+        "source-volume mode must use configOptions.addons_path verbatim: {conf}"
+    );
+    assert!(!conf.contains("/opt/odoo"), "no image defaults: {conf}");
 }
 
 #[test]
@@ -432,6 +578,35 @@ fn odoo_conf_moves_to_a_secret_when_the_password_is_secret_sourced() {
     // The mount path is identical either way, so nothing downstream of
     // /etc/odoo/odoo.conf has to care which kind it is.
     assert_eq!(odoo_conf_mount().mount_path, "/etc/odoo");
+}
+
+// ── readOnlySqlAccess on an adopted cluster ─────────────────────────────────
+
+#[test]
+fn readonly_sql_provisions_and_tears_down_on_an_owned_cluster() {
+    use odoo_operator::controller::odoo_instance::{readonly_sql_action, ReadOnlySqlAction};
+    assert_eq!(
+        readonly_sql_action(true, false),
+        ReadOnlySqlAction::Provision
+    );
+    assert_eq!(
+        readonly_sql_action(false, false),
+        ReadOnlySqlAction::Teardown
+    );
+}
+
+#[test]
+fn readonly_sql_is_skipped_not_attempted_on_an_adopted_cluster() {
+    use odoo_operator::controller::odoo_instance::{readonly_sql_action, ReadOnlySqlAction};
+    // Attempting it would fail 42501 forever, and because this runs before the
+    // status patch that would wedge the instance phase-less rather than just
+    // dropping one optional feature.
+    assert_eq!(
+        readonly_sql_action(true, true),
+        ReadOnlySqlAction::SkipUnsupported
+    );
+    // Teardown is skipped too: nothing was ever created there to remove.
+    assert_eq!(readonly_sql_action(false, true), ReadOnlySqlAction::Nothing);
 }
 
 // ── Namespaced CNPG credential mapping ──────────────────────────────────────

@@ -21,11 +21,18 @@
 #   DB_NAME                    — target database name
 #
 # Optional env vars:
-#   ODOO_CMD  — how to invoke Odoo.  Defaults to `odoo`, i.e. the executable on
-#               PATH in the official image.  The operator sets it (to something
-#               like `python3 /work/.../odoo-bin -c /etc/odoo/odoo.conf`) when
-#               spec.sourceVolume puts the Odoo source on a volume instead.
-#               Intentionally unquoted below so a multi-word value splits.
+#   ODOO_CMD       — how to invoke Odoo.  Defaults to `odoo`, i.e. the
+#                    executable on PATH in the official image.  The operator
+#                    sets it to `python3 /work/.../odoo-bin` when
+#                    spec.sourceVolume puts the Odoo source on a volume.
+#   ODOO_CONF_ARG  — `-c /etc/odoo/odoo.conf` in that same mode, empty
+#                    otherwise.
+#
+# Both are intentionally unquoted below so a multi-word value word-splits, and
+# both are empty by default so the invocation stays exactly `odoo neutralize`.
+# ODOO_CONF_ARG is separate from ODOO_CMD on purpose: Odoo's CLI dispatcher
+# only accepts a subcommand as the first argument when it does not start with
+# `-`, so `-c` must come AFTER `neutralize`, never before it.
 
 set -euo pipefail
 export PGPASSWORD=$PASSWORD
@@ -56,7 +63,7 @@ END $body$;
 EOSQL
 
 echo "=== Running odoo neutralize ==="
-${ODOO_CMD:-odoo} neutralize \
+${ODOO_CMD:-odoo} neutralize ${ODOO_CONF_ARG:-} \
     --db_host "$HOST" --db_port "$PORT" \
     --db_user "$USER" --db_password "$PASSWORD" \
     -d "$DB_NAME"

@@ -25,6 +25,7 @@ jobs:
     outputs:
       tag_name: ${{ steps.pick.outputs.tag_name }}
     steps:
+      - uses: actions/checkout@v4
       - id: pick
         env:
           PUSHED_TAG: ${{ github.ref_name }}
@@ -34,6 +35,28 @@ jobs:
             exit 1
           fi
           echo "tag_name=$PUSHED_TAG" >> "$GITHUB_OUTPUT"
+
+      # The tag is what names the image; Chart.yaml is what the chart installs
+      # and what the operator's default image resolves from; Cargo.toml is what
+      # the binary reports. A mismatch ships a chart pointing at an image tag
+      # that was built from different source, so fail before anything publishes.
+      - name: Verify tag matches Chart.yaml and Cargo.toml
+        env:
+          PUSHED_TAG: ${{ steps.pick.outputs.tag_name }}
+        run: |
+          want="${PUSHED_TAG#v}"
+          chart_version=$(sed -n 's/^version: *//p' charts/odoo-operator/Chart.yaml | head -n1 | tr -d '"')
+          chart_app=$(sed -n 's/^appVersion: *//p' charts/odoo-operator/Chart.yaml | head -n1 | tr -d '"')
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          rc=0
+          for pair in "Chart.yaml version:$chart_version" "Chart.yaml appVersion:$chart_app" "Cargo.toml version:$cargo_version"; do
+            label="${pair%%:*}"; got="${pair#*:}"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$label is '$got' but the tag says '$want'"
+              rc=1
+            fi
+          done
+          exit "$rc"
 
   # Single-arch (linux/amd64) build, pushed by digest and then stitched into a
   # manifest list by `merge`. The two-step push-by-digest + imagetools pattern
@@ -133,8 +156,10 @@ jobs:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve-ref.outputs.tag_name }}
         run: |
           docker buildx imagetools inspect "$IMAGE_REF"
-          # The manifest-list digest is sha256 over the raw manifest bytes.
-          DIGEST="sha256:$(docker buildx imagetools inspect "$IMAGE_REF" --raw | sha256sum | cut -d' ' -f1)"
+          # Ask the registry for the digest rather than recomputing it locally:
+          # hashing the raw bytes ourselves is one normalisation change away
+          # from silently reporting a digest nothing can pull.
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Manifest}}' | jq -r .digest)
           {
             echo "## Published image"
             echo

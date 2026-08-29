@@ -1723,10 +1723,13 @@ pub static TRANSITIONS: &[Transition] = &[
 
 /// Run one cycle of the state machine.  Returns the Action for the kube-rs
 /// controller runtime (requeue or await_change).
+/// `poll_external_secrets` asks the steady-state phases to wake up on a timer
+/// instead of only on a watch event. See [`requeue_for`].
 pub async fn run_state_machine(
     instance: &OdooInstance,
     ctx: &Context,
     snapshot: &ReconcileSnapshot,
+    poll_external_secrets: bool,
 ) -> Result<Action> {
     let phase = instance
         .status
@@ -1771,17 +1774,49 @@ pub async fn run_state_machine(
     }
 
     // 3. No transition — stay in current state, poll periodically.
-    Ok(requeue_for(&phase, snapshot))
+    Ok(requeue_for(&phase, snapshot, poll_external_secrets))
 }
 
+/// How often a steady-state instance whose configuration depends on an
+/// externally-owned Secret re-reconciles, so a rotation is eventually picked up.
+pub const EXTERNAL_SECRET_POLL: Duration = Duration::from_secs(600);
+
 /// Decide requeue strategy for phases that need periodic polling.
-fn requeue_for(phase: &OdooInstancePhase, snapshot: &ReconcileSnapshot) -> Action {
+///
+/// `poll_external_secrets` covers the instances whose rendered odoo.conf is
+/// built from a Secret this operator neither owns nor watches — the
+/// `spec.adminPasswordSecretRef` target, and an adopted CNPG cluster's `-app`
+/// Secret. Those phases would otherwise settle on `await_change()` and never
+/// notice a rotation, because no watched object changes when the Secret does.
+/// A bounded requeue bounds that staleness. Instances using neither feature
+/// keep `await_change()` exactly as before, so no-new-fields behaviour is
+/// unchanged and idle clusters stay idle.
+fn requeue_for(
+    phase: &OdooInstancePhase,
+    snapshot: &ReconcileSnapshot,
+    poll_external_secrets: bool,
+) -> Action {
     // If an upgrade job exists but its scheduled time hasn't arrived yet,
     // requeue so we wake up when it's due.
     if let Some(requeue) = scheduled_requeue(snapshot) {
         return requeue;
     }
 
+    match steady_requeue_interval(phase, poll_external_secrets) {
+        Some(d) => Action::requeue(d),
+        None => Action::await_change(),
+    }
+}
+
+/// The polling interval for a phase with no pending scheduled work, or `None`
+/// to wait for a watch event.
+///
+/// Split out from [`requeue_for`] so the policy is testable without building a
+/// whole [`ReconcileSnapshot`].
+pub(crate) fn steady_requeue_interval(
+    phase: &OdooInstancePhase,
+    poll_external_secrets: bool,
+) -> Option<Duration> {
     match phase {
         Starting
         | Initializing
@@ -1793,8 +1828,9 @@ fn requeue_for(phase: &OdooInstancePhase, snapshot: &ReconcileSnapshot) -> Actio
         | MigratingFilestore
         | FinalizingFilestoreMigration
         | MigratingDatabase
-        | FinalizingDatabaseMigration => Action::requeue(Duration::from_secs(10)),
-        _ => Action::await_change(),
+        | FinalizingDatabaseMigration => Some(Duration::from_secs(10)),
+        _ if poll_external_secrets => Some(EXTERNAL_SECRET_POLL),
+        _ => None,
     }
 }
 
@@ -1848,3 +1884,47 @@ use super::states::finalizing_database_migration::{
     clear_database_migration_status, complete_database_migration,
 };
 use super::states::migrating_database::{begin_database_migration, rollback_database_migration};
+
+#[cfg(test)]
+mod requeue_tests {
+    use super::*;
+
+    #[test]
+    fn steady_phases_wait_for_a_watch_event_by_default() {
+        // Upstream behaviour: an instance with none of the new spec fields
+        // must not start polling.
+        for phase in [Running, Stopped, Uninitialized, InitFailed, Error] {
+            assert_eq!(
+                steady_requeue_interval(&phase, false),
+                None,
+                "{phase} must await_change when no external secret is involved"
+            );
+        }
+    }
+
+    #[test]
+    fn steady_phases_poll_when_an_external_secret_backs_the_config() {
+        for phase in [Running, Stopped, Uninitialized] {
+            assert_eq!(
+                steady_requeue_interval(&phase, true),
+                Some(EXTERNAL_SECRET_POLL),
+                "{phase} must poll so a rotated Secret is eventually picked up"
+            );
+        }
+    }
+
+    #[test]
+    fn active_phases_keep_their_fast_poll_regardless() {
+        // The 10s progress poll must not be slowed to the secret interval.
+        for flag in [false, true] {
+            assert_eq!(
+                steady_requeue_interval(&Starting, flag),
+                Some(Duration::from_secs(10))
+            );
+            assert_eq!(
+                steady_requeue_interval(&Initializing, flag),
+                Some(Duration::from_secs(10))
+            );
+        }
+    }
+}

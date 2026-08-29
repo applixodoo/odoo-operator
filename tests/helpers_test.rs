@@ -78,6 +78,7 @@ fn test_build_odoo_conf_contains_required_keys() {
         5432,
         "odoo_db",
         &None,
+        true,
     );
 
     assert!(conf.starts_with("[options]\n"));
@@ -99,7 +100,7 @@ fn test_build_odoo_conf_with_extra_options() {
         ("max_cron_threads".to_string(), "1".to_string()),
     ]));
 
-    let conf = build_odoo_conf("u", "p", "a", "h", 5432, "d", &extra);
+    let conf = build_odoo_conf("u", "p", "a", "h", 5432, "d", &extra, true);
 
     assert!(conf.contains("workers = 4\n"));
     assert!(conf.contains("max_cron_threads = 1\n"));
@@ -107,7 +108,7 @@ fn test_build_odoo_conf_with_extra_options() {
 
 #[test]
 fn test_build_odoo_conf_prepends_standard_addons_path() {
-    let conf = build_odoo_conf("u", "p", "a", "h", 5432, "d", &None);
+    let conf = build_odoo_conf("u", "p", "a", "h", 5432, "d", &None, true);
     // The standard addons paths should be prepended.
     assert!(
         conf.contains("addons_path = /opt/odoo/addons,/opt/odoo/odoo/addons,/mnt/extra-addons\n")
@@ -116,7 +117,7 @@ fn test_build_odoo_conf_prepends_standard_addons_path() {
 
 #[test]
 fn test_build_odoo_conf_empty_admin_password_omitted() {
-    let conf = build_odoo_conf("u", "p", "", "h", 5432, "d", &None);
+    let conf = build_odoo_conf("u", "p", "", "h", 5432, "d", &None, true);
     assert!(!conf.contains("admin_passwd"));
 }
 

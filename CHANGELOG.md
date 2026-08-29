@@ -52,9 +52,38 @@ the chart. CI additionally runs on pushes to `droggol`.
 
 * New RBAC: `get`/`list`/`watch` on `postgresql.cnpg.io` `clusters`. Secret
   access was already granted.
-* `neutralize.sh` and `restore-neutralize.sh` now invoke `${ODOO_CMD:-odoo}`;
-  with the variable unset — i.e. whenever `spec.sourceVolume` is absent — this
-  is exactly the previous bare `odoo`.
+* `neutralize.sh` and `restore-neutralize.sh` now invoke
+  `${ODOO_CMD:-odoo} neutralize ${ODOO_CONF_ARG:-}`; with both unset — i.e.
+  whenever `spec.sourceVolume` is absent — this is exactly the previous bare
+  `odoo neutralize`. The config flag is deliberately a *separate* variable that
+  lands after the subcommand: Odoo's CLI dispatcher only reads a subcommand
+  from the first argument when it does not start with `-`, so folding `-c` into
+  `ODOO_CMD` would make it silently run a server instead of neutralizing.
+* `spec.database.cluster` resolution order is namespaced CNPG Cluster **first**,
+  clusters.yaml second, so a namespaced Cluster shadows a same-named
+  clusters.yaml key. Only a genuine 404 falls through; any other error (notably
+  a 403 from missing RBAC) fails the reconcile rather than silently resolving
+  the instance against a different database.
+* In `spec.sourceVolume` mode `addons_path` is exactly
+  `configOptions.addons_path` — the official image's `/opt/odoo/...` entries are
+  not prepended, since a toolchain image does not ship Odoo's source.
+* The operator does not manage `PYTHONPATH`. Odoo, the cron pod's exec probes
+  and any Odoo-adjacent tooling resolve imports from the image plus whatever
+  `spec.extraEnv` provides (where the platform passes `PYTHONPATH=/build`).
+* Instances using `spec.adminPasswordSecretRef` or an adopted CNPG cluster
+  re-reconcile on a 10-minute timer instead of waiting for a watch event, so a
+  rotated Secret is eventually picked up. Neither Secret is owned or watched by
+  the operator; a future improvement is to add `.watches()` on them and drop the
+  polling. Instances using neither feature keep `await_change()` unchanged.
+* `spec.readOnlySqlAccess` is ignored (with a Warning event) on an adopted CNPG
+  cluster: the app role can neither create nor drop roles there.
+* Migrating an instance *into* an adopted cluster is unsupported — the
+  migration path runs `createdb`, which the app role cannot do.
+* Known edges: an explicit `adminPassword: null` satisfies the CEL XOR (the
+  field is present) but fails at render time with a clear error; and switching
+  from `adminPasswordSecretRef` back to `adminPassword` leaves the now-unused
+  odoo.conf Secret in place until the CR is deleted, when its ownerReference
+  reaps it.
 
 ## [2.6.0](https://github.com/bemade/odoo-operator/compare/v2.5.0...v2.6.0) (2026-08-14)
 

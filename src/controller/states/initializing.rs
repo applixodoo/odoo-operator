@@ -14,8 +14,8 @@ use crate::controller::helpers::FIELD_MANAGER;
 use crate::controller::state_machine::scale_deployment;
 
 use crate::controller::helpers::{
-    apply_extra_env, cron_depl_name, odoo_entrypoint, odoo_probe_command, odoo_volume_mounts_for,
-    OdooJobBuilder,
+    apply_extra_env, cron_depl_name, odoo_entrypoint, odoo_entrypoint_shell, odoo_probe_command,
+    odoo_volume_mounts_for, OdooJobBuilder,
 };
 
 /// Initializing: init job is running, deployment must be scaled down.
@@ -134,13 +134,14 @@ pub fn build_init_job(
 /// interchangeable. The `--version` probe must reach the binary directly — put
 /// the image entrypoint in front of it and it blocks on `wait-for-psql.py`
 /// first — while the real run wants the full launch command. Hence
-/// `odoo_probe_command` for the former and `odoo_entrypoint` for the latter.
+/// `odoo_probe_command` for the former and `odoo_entrypoint_shell` for the
+/// latter. Both quote interpolated paths — this string is parsed by a shell.
 ///
 /// With no `spec.sourceVolume` this renders byte-for-byte what the operator
-/// has always emitted; `tests/controller_helpers_test.rs` pins that string.
+/// has always emitted; `tests/droggol_fork_test.rs` pins that string.
 fn demo_probe_script(instance: &OdooInstance) -> String {
     let probe = odoo_probe_command(instance);
-    let exec = odoo_entrypoint(instance).join(" ");
+    let exec = odoo_entrypoint_shell(instance);
     format!(
         "maj=$({probe} --version 2>/dev/null | grep -oE '[0-9]+' | head -n1); \
          flag=''; [ \"${{maj:-0}}\" -ge 19 ] && flag='--with-demo'; \

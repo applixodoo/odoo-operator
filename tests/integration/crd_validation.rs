@@ -151,6 +151,28 @@ async fn source_volume_with_a_relative_odoo_bin_is_rejected() {
 }
 
 #[tokio::test]
+async fn source_volume_with_whitespace_in_odoo_bin_is_rejected() {
+    // odooBin reaches the neutralize scripts through an environment variable
+    // the shell word-splits; quoting it there is impossible, so whitespace has
+    // to be rejected at admission rather than silently splitting into two args.
+    let ctx = TestContext::new_ns().await;
+    let body = instance_with_spec("sv-space", &ctx.ns, |spec| {
+        spec["sourceVolume"] = json!({
+            "claimName": "prod-src",
+            "mounts": [{ "mountPath": "/work" }],
+            "odooBin": "/work/my instances/odoo-bin",
+        });
+    });
+    let err = try_create(&ctx.client, &ctx.ns, body)
+        .await
+        .expect_err("whitespace in odooBin must be rejected");
+    assert!(
+        err.contains("odooBin must not contain whitespace"),
+        "unexpected rejection message: {err}"
+    );
+}
+
+#[tokio::test]
 async fn source_volume_with_a_relative_mount_path_is_rejected() {
     let ctx = TestContext::new_ns().await;
     let body = instance_with_spec("sv-relmount", &ctx.ns, |spec| {

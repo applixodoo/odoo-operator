@@ -620,6 +620,14 @@ spec:
                 nullable: true
                 properties:
                   cluster:
+                    description: |-
+                      Which PostgreSQL cluster to use.
+
+                      Resolved in two steps, and the order is deliberate: a `postgresql.cnpg.io/v1` Cluster of this name in the instance's **own namespace** wins, and only if none exists is the name looked up as a key in the operator's `clusters.yaml` Secret. A namespaced Cluster therefore *shadows* a same-named clusters.yaml entry — intentional, so a tenant's own database is never silently overridden by a global name, but worth knowing when picking cluster names.
+
+                      Only a genuine 404 counts as "no such Cluster". Any other error from that lookup (notably a 403 from missing RBAC) fails the reconcile rather than falling through to clusters.yaml, since falling through would point the instance at an entirely different database.
+
+                      A namespaced Cluster is *adopted*: its database and owning role are assumed to exist already, and the operator neither creates nor drops them. Migrating an instance INTO an adopted cluster is not supported — the migration path runs `createdb`, which the app role cannot do.
                     nullable: true
                     type: string
                   missingPolicy:
@@ -1056,6 +1064,8 @@ spec:
               rule: '!has(self.sourceVolume) || self.sourceVolume.odooBin.startsWith(''/'')'
             - messageExpression: '''spec.sourceVolume.mounts[].mountPath must be an absolute path'''
               rule: '!has(self.sourceVolume) || self.sourceVolume.mounts.all(m, m.mountPath.startsWith(''/''))'
+            - messageExpression: '''spec.sourceVolume.odooBin must not contain whitespace'''
+              rule: '!has(self.sourceVolume) || !self.sourceVolume.odooBin.contains('' '')'
           status:
             description: OdooInstanceStatus defines the observed state of OdooInstance.
             nullable: true

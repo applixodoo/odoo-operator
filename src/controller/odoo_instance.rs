@@ -289,6 +289,38 @@ fn error_policy(instance: Arc<OdooInstance>, error: &Error, _ctx: Arc<Context>) 
     Action::requeue(Duration::from_secs(30))
 }
 
+/// What the reconcile should do about `spec.readOnlySqlAccess` this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlySqlAction {
+    /// Ensure the read-only role and its Secret exist.
+    Provision,
+    /// Remove them — the feature was disabled (or never enabled).
+    Teardown,
+    /// Enabled, but impossible on this cluster; warn and carry on.
+    SkipUnsupported,
+    /// Nothing to do.
+    Nothing,
+}
+
+/// Decide the read-only-SQL action from the two inputs that matter.
+///
+/// The adopted case is the interesting one. Provisioning needs CREATE ROLE and
+/// teardown needs DROP ROLE, neither of which a CNPG tenant's app role has —
+/// and the cluster has no superuser to borrow. Attempting either fails with
+/// 42501 forever. Crucially this runs *before* the status patch, so returning
+/// that error would wedge the instance in a phase-less state rather than merely
+/// dropping one optional feature; skipping loudly is the containable failure.
+/// Teardown is skipped for the mirror-image reason: the operator never created
+/// a role on an adopted cluster, so there is nothing there to remove.
+pub fn readonly_sql_action(ro_enabled: bool, adopted: bool) -> ReadOnlySqlAction {
+    match (ro_enabled, adopted) {
+        (true, true) => ReadOnlySqlAction::SkipUnsupported,
+        (false, true) => ReadOnlySqlAction::Nothing,
+        (true, false) => ReadOnlySqlAction::Provision,
+        (false, false) => ReadOnlySqlAction::Teardown,
+    }
+}
+
 // ── Core reconcile logic ──────────────────────────────────────────────────────
 
 async fn reconcile_instance(instance: &OdooInstance, ctx: &Context) -> Result<Action> {
@@ -364,14 +396,32 @@ async fn reconcile_instance(instance: &OdooInstance, ctx: &Context) -> Result<Ac
         .read_only_sql_access
         .as_ref()
         .is_some_and(|s| s.enabled);
-    if ro_enabled {
-        child_resources::ensure_readonly_role(ctx, instance, &pg_cluster, &oref).await?;
-    } else {
-        // Tear down if previously enabled and now disabled (idempotent — no-op
-        // if the role never existed or was already removed).
-        if let Err(e) = child_resources::delete_readonly_role(ctx, instance, &pg_cluster).await {
-            warn!(%name, %e, "failed to remove read-only role on disable — will retry");
+    match readonly_sql_action(ro_enabled, pg_cluster.adopted) {
+        ReadOnlySqlAction::Provision => {
+            child_resources::ensure_readonly_role(ctx, instance, &pg_cluster, &oref).await?;
         }
+        ReadOnlySqlAction::Teardown => {
+            // Idempotent — no-op if the role never existed or was already gone.
+            if let Err(e) = child_resources::delete_readonly_role(ctx, instance, &pg_cluster).await
+            {
+                warn!(%name, %e, "failed to remove read-only role on disable — will retry");
+            }
+        }
+        ReadOnlySqlAction::SkipUnsupported => {
+            publish_event(
+                ctx,
+                instance,
+                EventType::Warning,
+                "ReadOnlySqlAccessUnsupported",
+                "Reconcile",
+                Some(format!(
+                    "spec.readOnlySqlAccess is not supported on the adopted CNPG cluster \
+                     {cluster_name:?}: its app role cannot create roles. Ignoring."
+                )),
+            )
+            .await;
+        }
+        ReadOnlySqlAction::Nothing => {}
     }
 
     // Gather the observed world into a snapshot.
@@ -560,7 +610,15 @@ async fn reconcile_instance(instance: &OdooInstance, ctx: &Context) -> Result<Ac
 
     // Run the state machine: ensure phase outputs, evaluate transitions.
     let previous_phase = instance.status.as_ref().and_then(|s| s.phase.clone());
-    let action = super::state_machine::run_state_machine(instance, ctx, &snapshot).await?;
+    // The odoo.conf this instance renders may depend on a Secret the operator
+    // neither owns nor watches: the adminPasswordSecretRef target, or an
+    // adopted CNPG cluster's `-app` credentials. Neither produces a watch event
+    // on rotation, so those instances poll instead of settling on await_change.
+    let poll_external_secrets =
+        instance.spec.admin_password_secret_ref.is_some() || pg_cluster.adopted;
+    let action =
+        super::state_machine::run_state_machine(instance, ctx, &snapshot, poll_external_secrets)
+            .await?;
 
     // Re-read phase after state machine may have patched it.
     let new_phase = api.get_status(&name).await?.status.and_then(|s| s.phase);
@@ -654,33 +712,39 @@ async fn cleanup_instance(instance: &OdooInstance, ctx: &Context) -> Result<Acti
         // destroy data the operator never provisioned — and would fail anyway,
         // since the app role cannot drop itself. The Cluster's own lifecycle
         // is what reclaims that storage.
+        //
+        // Note this skips only the *current* cluster: the
+        // `migration_previous_cluster` block below still runs, because that
+        // one names a clusters.yaml cluster whose role the operator really did
+        // create and must still clean up.
         if pg_cluster.adopted {
             info!(%name, %cluster_name, "adopted cluster — skipping postgres role cleanup");
-            return Ok(Action::await_change());
-        }
+        } else {
+            // Best-effort: clean up the read-only role before the owner role so
+            // we don't leave orphaned grants.  Non-fatal — the owner role drop
+            // is what the finalizer must guarantee; the RO role has no owned
+            // databases.
+            if let Err(e) = child_resources::delete_readonly_role(ctx, instance, &pg_cluster).await
+            {
+                warn!(%name, %e, "failed to delete read-only postgres role during cleanup (non-fatal)");
+            }
 
-        // Best-effort: clean up the read-only role before the owner role so we
-        // don't leave orphaned grants.  Non-fatal — the owner role drop is what
-        // the finalizer must guarantee; the RO role has no owned databases.
-        if let Err(e) = child_resources::delete_readonly_role(ctx, instance, &pg_cluster).await {
-            warn!(%name, %e, "failed to delete read-only postgres role during cleanup (non-fatal)");
-        }
-
-        if let Err(e) = ctx.postgres.delete_role(&pg_cluster, &username).await {
-            warn!(%name, %e, "failed to delete postgres role — retaining finalizer for retry");
-            publish_event(
-                ctx,
-                instance,
-                EventType::Warning,
-                "CleanupFailed",
-                "Finalize",
-                Some(format!("Failed to delete postgres role: {e}")),
-            )
-            .await;
-            // Return Err so the kube-rs finalizer helper keeps the finalizer
-            // in place and the controller requeues — otherwise we orphan the
-            // postgres role and block same-name re-create (issue #119).
-            return Err(e);
+            if let Err(e) = ctx.postgres.delete_role(&pg_cluster, &username).await {
+                warn!(%name, %e, "failed to delete postgres role — retaining finalizer for retry");
+                publish_event(
+                    ctx,
+                    instance,
+                    EventType::Warning,
+                    "CleanupFailed",
+                    "Finalize",
+                    Some(format!("Failed to delete postgres role: {e}")),
+                )
+                .await;
+                // Return Err so the kube-rs finalizer helper keeps the finalizer
+                // in place and the controller requeues — otherwise we orphan the
+                // postgres role and block same-name re-create (issue #119).
+                return Err(e);
+            }
         }
 
         // If deleted mid-migration, also clean up the old cluster.
@@ -841,13 +905,21 @@ async fn resolve_namespaced_cnpg_cluster(
     let clusters: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &ar);
     match clusters.get(cluster_name).await {
         Ok(_) => {}
-        Err(kube::Error::Api(ref e)) if e.code == 404 => return Ok(None),
-        Err(e) => {
-            // A missing CNPG CRD surfaces as 404 on the collection rather than
-            // the object; anything else (RBAC, apiserver down) is worth
-            // logging but must still fall back rather than wedge the instance.
-            debug!(%ns, %cluster_name, %e, "CNPG Cluster lookup failed; falling back to clusters.yaml");
+        // 404 is the only answer that means "no such Cluster here". It also
+        // covers a cluster with no CNPG installed at all, since the apiserver
+        // 404s the whole resource path in that case.
+        Err(kube::Error::Api(ref e)) if e.code == 404 => {
+            debug!(%ns, %cluster_name, "no namespaced CNPG Cluster; using clusters.yaml");
             return Ok(None);
+        }
+        // Anything else — 403 from missing RBAC, a timeout, an apiserver blip —
+        // must NOT be read as absence. Falling back on those would silently
+        // resolve the instance against a completely different database, and
+        // would flap between the two modes as the error came and went.
+        Err(e) => {
+            return Err(Error::config(format!(
+                "looking up CNPG Cluster {cluster_name:?} in namespace {ns:?}: {e}"
+            )));
         }
     }
 

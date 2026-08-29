@@ -30,6 +30,18 @@ const EXTRACT_SCRIPT: &str = include_str!("../../../scripts/restore-extract.sh")
 const LOAD_DB_SCRIPT: &str = include_str!("../../../scripts/restore-load-db.sh");
 const NEUTRALIZE_SCRIPT: &str = include_str!("../../../scripts/restore-neutralize.sh");
 
+/// Scratch volume backing `data_dir` for the restore-path neutralize step in
+/// source-volume mode. See where it is mounted for why it is an emptyDir.
+const NEUTRALIZE_DATA_DIR_VOLUME: &str = "odoo-data-dir";
+
+fn neutralize_data_dir_mount() -> VolumeMount {
+    VolumeMount {
+        name: NEUTRALIZE_DATA_DIR_VOLUME.into(),
+        mount_path: "/var/lib/odoo".into(),
+        ..Default::default()
+    }
+}
+
 /// Restoring: restore job running, deployment must be down.
 ///
 /// Every tick: ensure deployment scaled to 0, ensure K8s Job exists (create if
@@ -242,8 +254,15 @@ impl State for Restoring {
             // This job runs `without_standard_volumes`, so in source-volume mode
             // the Odoo step needs the source claim and odoo.conf added back —
             // otherwise `addons_path` is unset and the module tree is invisible.
+            //
+            // The conf it then reads sets `data_dir = /var/lib/odoo`, which
+            // this pod does not mount (upstream relies on the stock image
+            // simply having that directory). A toolchain image need not, so
+            // back it with a scratch emptyDir: neutralize only rewrites rows,
+            // it produces nothing worth persisting, but Odoo still insists on a
+            // writable data_dir at startup.
             let neut_mounts = if instance.spec.source_volume.is_some() {
-                let mut m = vec![odoo_conf_mount()];
+                let mut m = vec![odoo_conf_mount(), neutralize_data_dir_mount()];
                 m.extend(source_volume_mounts(instance));
                 Some(m)
             } else {
@@ -295,6 +314,11 @@ impl State for Restoring {
         let mut extra_vols = vec![workspace_vol, filestore_vol];
         if instance.spec.source_volume.is_some() {
             extra_vols.push(odoo_conf_volume(instance));
+            extra_vols.push(Volume {
+                name: NEUTRALIZE_DATA_DIR_VOLUME.into(),
+                empty_dir: Some(Default::default()),
+                ..Default::default()
+            });
             extra_vols.extend(source_volumes(instance));
         }
 
