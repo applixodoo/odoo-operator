@@ -18,8 +18,9 @@ use crate::notify;
 
 use super::{Context, ReconcileSnapshot, State};
 use crate::controller::helpers::{
-    apply_extra_env, cm_env, cron_depl_name, env, pg_tools_image, staging_mail_env_vars,
-    OdooJobBuilder, FIELD_MANAGER,
+    apply_extra_env, cm_env, cron_depl_name, env, odoo_cmd_env, odoo_conf_mount, odoo_conf_volume,
+    pg_tools_image, source_volume_mounts, source_volumes, staging_mail_env_vars, OdooJobBuilder,
+    FIELD_MANAGER,
 };
 use crate::controller::state_machine::scale_deployment;
 
@@ -235,6 +236,19 @@ impl State for Restoring {
                 env("DB_NAME", db.clone()),
             ];
             neut_env.extend(staging_mail_env_vars(instance, &ctx.defaults));
+            // Points `restore-neutralize.sh` at odoo-bin on the source volume;
+            // empty (no-op) when `spec.sourceVolume` is unset.
+            neut_env.extend(odoo_cmd_env(instance));
+            // This job runs `without_standard_volumes`, so in source-volume mode
+            // the Odoo step needs the source claim and odoo.conf added back —
+            // otherwise `addons_path` is unset and the module tree is invisible.
+            let neut_mounts = if instance.spec.source_volume.is_some() {
+                let mut m = vec![odoo_conf_mount()];
+                m.extend(source_volume_mounts(instance));
+                Some(m)
+            } else {
+                None
+            };
             // Neutralize runs the Odoo image; layer the instance's extra env on
             // (the `noop` alpine fallback below and the pg/mc tooling containers
             // are left untouched — see `apply_extra_env`).
@@ -248,6 +262,7 @@ impl State for Restoring {
                         NEUTRALIZE_SCRIPT.into(),
                     ]),
                     env: Some(neut_env),
+                    volume_mounts: neut_mounts,
                     ..Default::default()
                 },
                 instance,
@@ -277,10 +292,16 @@ impl State for Restoring {
             ..Default::default()
         };
 
+        let mut extra_vols = vec![workspace_vol, filestore_vol];
+        if instance.spec.source_volume.is_some() {
+            extra_vols.push(odoo_conf_volume(instance));
+            extra_vols.extend(source_volumes(instance));
+        }
+
         let job = OdooJobBuilder::new(&format!("{crd_name}-"), &ns, restore_job, instance)
             .active_deadline(3600)
             .without_standard_volumes()
-            .extra_volumes(vec![workspace_vol, filestore_vol])
+            .extra_volumes(extra_vols)
             .init_containers(init_containers)
             .containers(vec![main_container])
             .build();

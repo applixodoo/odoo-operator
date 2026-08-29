@@ -28,6 +28,76 @@ pub struct IngressSpec {
     pub gateway_ref: Option<GatewayRef>,
 }
 
+/// One mount of the [`SourceVolumeSpec`] claim into an Odoo container.
+///
+/// The same claim is usually mounted more than once — the platform that owns
+/// the claim lays out both the Odoo checkouts and a `pip install --target`
+/// dependency tree on it, and the runtime has to reproduce the *absolute*
+/// paths the build step used (e.g. whole volume at `/work`, `subPath: build`
+/// at `/build`).
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceVolumeMount {
+    /// Absolute path inside the container.
+    pub mount_path: String,
+    /// Optional path *within* the volume to mount at `mountPath`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_path: Option<String>,
+    /// Mount read-only. Defaults to `false`.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// SourceVolumeSpec points the instance at an externally managed volume that
+/// carries the Odoo source tree, and tells the operator how to launch it.
+///
+/// The stock operator hardcodes the official Odoo Docker image's launch
+/// convention (`/entrypoint.sh odoo …`). An image built by a different
+/// toolchain has no `/entrypoint.sh`, and its Odoo source lives on a volume
+/// rather than baked into the image — so every container that executes Odoo
+/// must instead run `python3 <odooBin> -c /etc/odoo/odoo.conf …` with the
+/// claim mounted.
+///
+/// When this field is absent the operator behaves exactly as upstream: no
+/// extra volumes, and the `/entrypoint.sh` convention is used unchanged.
+///
+/// The claim itself is *never* created by the operator — it is adopted. The
+/// owning platform is responsible for populating it before the instance runs.
+///
+/// Note the `-c /etc/odoo/odoo.conf` is not optional: the official image
+/// exports `ODOO_RC` pointing there, and bypassing the entrypoint also
+/// bypasses that, so the config file (which carries `addons_path`, `db_host`,
+/// `db_user`, `db_password`, …) has to be named explicitly or Odoo starts
+/// with nothing but defaults.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceVolumeSpec {
+    /// Name of the pre-existing PersistentVolumeClaim holding the source tree.
+    pub claim_name: String,
+    /// How to mount that claim. Must be non-empty.
+    pub mounts: Vec<SourceVolumeMount>,
+    /// Absolute path to `odoo-bin` **as seen through `mounts`**.
+    pub odoo_bin: String,
+}
+
+/// AdminPasswordSecretRef sources the Odoo master password from a Secret
+/// instead of carrying it in plaintext in the CR.
+///
+/// Exactly one of `spec.adminPassword` and `spec.adminPasswordSecretRef` must
+/// be set; the CRD rejects a CR that sets both or neither.
+///
+/// When the ref is used the rendered `odoo.conf` is written to a **Secret**
+/// rather than the usual ConfigMap, so the master password never lands in a
+/// world-readable object — see `child_resources::ensure_config_map`.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminPasswordSecretRef {
+    /// Name of the Secret, in the instance's own namespace.
+    pub name: String,
+    /// Key within that Secret holding the master password.
+    pub key: String,
+}
+
 /// FilestoreSpec defines persistent storage for the Odoo filestore.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -312,6 +382,30 @@ fn default_init_modules() -> Vec<String> {
     rule = Rule::new("self.environment != 'Production' || !has(self.productionInstanceRef)")
         .message(Message::Expression(
             "'spec.productionInstanceRef is forbidden on production instances'".into()
+        )),
+    // Exactly one of the two master-password sources. `adminPassword` used to
+    // be a required field, so "neither" was unrepresentable and "both" did not
+    // exist — this rule is what keeps that invariant now that the field is
+    // optional. Enforced here (rather than only in the validating webhook)
+    // because the webhook is registered for UPDATE only, so CREATE would
+    // otherwise slip through.
+    rule = Rule::new("has(self.adminPassword) != has(self.adminPasswordSecretRef)")
+        .message(Message::Expression(
+            "'exactly one of spec.adminPassword and spec.adminPasswordSecretRef must be set'".into()
+        )),
+    rule = Rule::new("!has(self.sourceVolume) || size(self.sourceVolume.mounts) > 0")
+        .message(Message::Expression(
+            "'spec.sourceVolume.mounts must not be empty'".into()
+        )),
+    rule = Rule::new("!has(self.sourceVolume) || self.sourceVolume.odooBin.startsWith('/')")
+        .message(Message::Expression(
+            "'spec.sourceVolume.odooBin must be an absolute path'".into()
+        )),
+    rule = Rule::new(
+        "!has(self.sourceVolume) || self.sourceVolume.mounts.all(m, m.mountPath.startsWith('/'))"
+    )
+        .message(Message::Expression(
+            "'spec.sourceVolume.mounts[].mountPath must be an absolute path'".into()
         ))
 )]
 #[kube(
@@ -336,7 +430,20 @@ pub struct OdooInstanceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_pull_secret: Option<String>,
 
-    pub admin_password: String,
+    /// Odoo master password, in plaintext. Mutually exclusive with
+    /// [`OdooInstanceSpec::admin_password_secret_ref`] — exactly one of the two
+    /// must be set (enforced by CEL on the CRD and by the validating webhook).
+    ///
+    /// Still honoured exactly as before for every CR that sets it; it became
+    /// `Option` only so the Secret-backed alternative could exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_password: Option<String>,
+
+    /// Source the master password from a Secret instead of `adminPassword`.
+    /// In this mode the rendered `odoo.conf` is stored in a Secret rather than
+    /// a ConfigMap so the password is not left in a world-readable object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_password_secret_ref: Option<AdminPasswordSecretRef>,
 
     #[serde(default = "default_replicas")]
     pub replicas: i32,
@@ -421,10 +528,46 @@ pub struct OdooInstanceSpec {
     /// but it cannot override an operator env var — use `extra_env` for that.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_env_from: Vec<EnvFromSource>,
+
+    /// Run Odoo from a source tree on an externally managed volume rather than
+    /// from the image, using `python3 <odooBin>` in place of the official
+    /// image's `/entrypoint.sh` convention. Absent = upstream behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_volume: Option<SourceVolumeSpec>,
+
+    /// `runAsUser` for every Odoo pod and job pod. Defaults to 100, the uid in
+    /// the official Odoo image. Set this when the image runs Odoo as a
+    /// different uid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as_user: Option<i64>,
+
+    /// `runAsGroup` (and `fsGroup`) for every Odoo pod and job pod. Defaults to
+    /// 101, the gid in the official Odoo image. `fsGroup` follows this value so
+    /// the filestore PVC stays writable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as_group: Option<i64>,
 }
 
 fn default_replicas() -> i32 {
     1
+}
+
+/// uid the official Odoo Docker image runs as; the operator's default.
+pub const DEFAULT_RUN_AS_USER: i64 = 100;
+/// gid the official Odoo Docker image runs as; the operator's default.
+pub const DEFAULT_RUN_AS_GROUP: i64 = 101;
+
+impl OdooInstanceSpec {
+    /// Effective `runAsUser` — [`DEFAULT_RUN_AS_USER`] unless overridden.
+    pub fn effective_run_as_user(&self) -> i64 {
+        self.run_as_user.unwrap_or(DEFAULT_RUN_AS_USER)
+    }
+
+    /// Effective `runAsGroup` — [`DEFAULT_RUN_AS_GROUP`] unless overridden.
+    /// Also used as `fsGroup`.
+    pub fn effective_run_as_group(&self) -> i64 {
+        self.run_as_group.unwrap_or(DEFAULT_RUN_AS_GROUP)
+    }
 }
 
 // ── Status ────────────────────────────────────────────────────────────────────

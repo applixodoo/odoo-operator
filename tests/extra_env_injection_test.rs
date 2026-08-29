@@ -34,7 +34,8 @@ fn make_instance(extra_env: Vec<EnvVar>, extra_env_from: Vec<EnvFromSource>) -> 
         spec: OdooInstanceSpec {
             image: None,
             image_pull_secret: None,
-            admin_password: "admin".to_string(),
+            admin_password: Some("admin".to_string()),
+            admin_password_secret_ref: None,
             replicas: 1,
             cron: CronSpec::default(),
             ingress: IngressSpec {
@@ -58,6 +59,9 @@ fn make_instance(extra_env: Vec<EnvVar>, extra_env_from: Vec<EnvFromSource>) -> 
             read_only_sql_access: None,
             extra_env,
             extra_env_from,
+            source_volume: None,
+            run_as_user: None,
+            run_as_group: None,
         },
         status: None,
     }

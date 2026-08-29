@@ -107,8 +107,40 @@ pub async fn run(listener: tokio::net::TcpListener, tls_cert: &str, tls_key: &st
     warp::serve(route).run_incoming(incoming).await;
 }
 
+/// Exactly one of `spec.adminPassword` / `spec.adminPasswordSecretRef` must be
+/// set. Returns the denial message when the object violates that.
+///
+/// The CRD carries the same rule as a CEL validation, which is what covers
+/// CREATE — this webhook is only registered for UPDATE. Duplicating it here
+/// keeps the invariant unit-testable and holds even on a cluster whose CRD
+/// predates the CEL rule.
+fn admin_password_violation(instance: &OdooInstance) -> Option<String> {
+    match (
+        instance.spec.admin_password.is_some(),
+        instance.spec.admin_password_secret_ref.is_some(),
+    ) {
+        (true, false) | (false, true) => None,
+        (true, true) => Some(
+            "spec.adminPassword and spec.adminPasswordSecretRef are mutually exclusive — set exactly one"
+                .to_string(),
+        ),
+        (false, false) => Some(
+            "one of spec.adminPassword or spec.adminPasswordSecretRef must be set".to_string(),
+        ),
+    }
+}
+
 /// Validate an OdooInstance admission request.
 fn validate(req: AdmissionRequest<OdooInstance>) -> AdmissionResponse {
+    // The master-password XOR is checked for any object the request carries,
+    // including CREATE — the rest of the rules below are diffs and need an
+    // old object, but this one is a property of the new object alone.
+    if let Some(ref new) = req.object {
+        if let Some(msg) = admin_password_violation(new) {
+            return AdmissionResponse::from(&req).deny(msg);
+        }
+    }
+
     // CREATE and DELETE are always allowed.
     if req.old_object.is_none() {
         return AdmissionResponse::from(&req);
@@ -521,6 +553,93 @@ mod tests {
             resp.allowed,
             "rollback to previous storageClass should be allowed during migration"
         );
+    }
+
+    // ── master-password XOR ─────────────────────────────────────────────
+
+    /// Build an UPDATE request whose new object carries the given
+    /// master-password shape. The old object is always the plaintext form, so
+    /// only the new object's shape is under test.
+    fn make_admin_password_request(
+        plaintext: bool,
+        secret_ref: bool,
+    ) -> AdmissionRequest<OdooInstance> {
+        let mut spec = serde_json::json!({
+            "ingress": { "hosts": ["test.example.com"] }
+        });
+        if plaintext {
+            spec["adminPassword"] = serde_json::json!("admin");
+        }
+        if secret_ref {
+            spec["adminPasswordSecretRef"] = serde_json::json!({ "name": "pw", "key": "password" });
+        }
+        let new_obj = serde_json::json!({
+            "apiVersion": "bemade.org/v1alpha1",
+            "kind": "OdooInstance",
+            "metadata": { "name": "test", "namespace": "default", "uid": "test-uid" },
+            "spec": spec
+        });
+        let review: serde_json::Value = serde_json::json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "req-pw",
+                "kind": { "group": "bemade.org", "version": "v1alpha1", "kind": "OdooInstance" },
+                "resource": { "group": "bemade.org", "version": "v1alpha1", "resource": "odooinstances" },
+                "name": "test",
+                "namespace": "default",
+                "operation": "UPDATE",
+                "userInfo": { "username": "test" },
+                "object": new_obj,
+                "oldObject": make_instance_json(None, None),
+                "dryRun": false,
+            }
+        });
+        let ar: kube::core::admission::AdmissionReview<OdooInstance> =
+            serde_json::from_value(review).expect("valid AdmissionReview");
+        ar.try_into().expect("valid AdmissionRequest")
+    }
+
+    #[test]
+    fn test_admin_password_plaintext_only_is_allowed() {
+        let resp = validate(make_admin_password_request(true, false));
+        assert!(
+            resp.allowed,
+            "plaintext adminPassword alone must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_admin_password_secret_ref_only_is_allowed() {
+        let resp = validate(make_admin_password_request(false, true));
+        assert!(resp.allowed, "adminPasswordSecretRef alone must be allowed");
+    }
+
+    #[test]
+    fn test_admin_password_both_is_rejected() {
+        let resp = validate(make_admin_password_request(true, true));
+        assert!(
+            !resp.allowed,
+            "setting both adminPassword and adminPasswordSecretRef must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_admin_password_neither_is_rejected() {
+        let resp = validate(make_admin_password_request(false, false));
+        assert!(
+            !resp.allowed,
+            "setting neither adminPassword nor adminPasswordSecretRef must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_admin_password_xor_precedes_other_rules() {
+        // A request that ALSO shrinks storage must still be denied; the point
+        // is that the XOR check runs before the early return for CREATE, so it
+        // cannot be bypassed by omitting an old object.
+        let violation = make_admin_password_request(true, true);
+        assert!(!validate(violation).allowed);
     }
 
     #[test]

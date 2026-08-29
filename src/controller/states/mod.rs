@@ -36,7 +36,10 @@ pub use error::Error;
 pub use finalizing_database_migration::FinalizingDatabaseMigration;
 pub use finalizing_filestore_migration::FinalizingFilestoreMigration;
 pub use init_failed::InitFailed;
-pub use initializing::Initializing;
+// `build_init_job` is exported so the fork's tests can assert on the exact
+// argv it produces — that pod command is the compatibility contract with the
+// official Odoo image's entrypoint convention.
+pub use initializing::{build_init_job, Initializing};
 pub use migrating_database::MigratingDatabase;
 pub use migrating_filestore::MigratingFilestore;
 pub use provisioning::Provisioning;

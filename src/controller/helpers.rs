@@ -87,41 +87,95 @@ pub fn controller_owner_ref<K: Resource<DynamicType = ()>>(obj: &K) -> OwnerRefe
     }
 }
 
-/// Standard Odoo pod security context (uid 100 / gid 101).
+/// Odoo pod security context.
 ///
-/// Every Odoo container and job pod in this operator runs with the same
-/// non-root identity matching the official Odoo Docker image.
-pub fn odoo_security_context() -> PodSecurityContext {
+/// Defaults to uid 100 / gid 101 — the identity in the official Odoo Docker
+/// image, which is what every pod ran as before `spec.runAsUser` /
+/// `spec.runAsGroup` existed. `fsGroup` tracks `runAsGroup` so the filestore
+/// PVC stays writable for whichever identity the image actually uses.
+pub fn odoo_security_context(instance: &OdooInstance) -> PodSecurityContext {
     PodSecurityContext {
-        run_as_user: Some(100),
-        run_as_group: Some(101),
-        fs_group: Some(101),
+        run_as_user: Some(instance.spec.effective_run_as_user()),
+        run_as_group: Some(instance.spec.effective_run_as_group()),
+        fs_group: Some(instance.spec.effective_run_as_group()),
+        ..Default::default()
+    }
+}
+
+/// Directory the odoo-conf volume is mounted at.
+pub const ODOO_CONF_DIR: &str = "/etc/odoo";
+/// Absolute path of the rendered odoo.conf inside every Odoo container.
+pub const ODOO_CONF_PATH: &str = "/etc/odoo/odoo.conf";
+/// Pod volume name for `spec.sourceVolume`'s claim.
+pub const SOURCE_VOLUME_NAME: &str = "odoo-source";
+
+/// Name of the object holding the rendered odoo.conf.
+///
+/// Deliberately the same string for the ConfigMap and the Secret variants:
+/// they are distinct resource kinds, so the name can be reused, and every
+/// consumer that looks the object up by name keeps working across a switch.
+pub fn odoo_conf_name(instance_name: &str) -> String {
+    format!("{instance_name}-odoo-conf")
+}
+
+/// Whether the rendered odoo.conf lives in a Secret rather than a ConfigMap.
+///
+/// True exactly when the master password is sourced from a Secret — in that
+/// mode `admin_passwd` must not end up in a ConfigMap, so the whole conf moves
+/// to a Secret and the pod mounts that instead.
+pub fn odoo_conf_in_secret(instance: &OdooInstance) -> bool {
+    instance.spec.admin_password_secret_ref.is_some()
+}
+
+/// The `odoo-conf` volume: a ConfigMap normally, a Secret when the master
+/// password is Secret-sourced.
+pub fn odoo_conf_volume(instance: &OdooInstance) -> Volume {
+    let name = odoo_conf_name(&instance.name_any());
+    if odoo_conf_in_secret(instance) {
+        Volume {
+            name: "odoo-conf".to_string(),
+            secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                secret_name: Some(name),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    } else {
+        Volume {
+            name: "odoo-conf".to_string(),
+            config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
+                name,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+/// The mount matching [`odoo_conf_volume`].
+pub fn odoo_conf_mount() -> VolumeMount {
+    VolumeMount {
+        name: "odoo-conf".to_string(),
+        mount_path: ODOO_CONF_DIR.to_string(),
         ..Default::default()
     }
 }
 
 /// Standard volumes shared by the instance Deployment and every job pod:
-/// the filestore PVC and the odoo-conf ConfigMap.
-pub fn odoo_volumes(instance_name: &str) -> Vec<Volume> {
+/// the filestore PVC and the odoo-conf object.
+pub fn odoo_volumes(instance: &OdooInstance) -> Vec<Volume> {
     vec![
         Volume {
             name: "filestore".to_string(),
             persistent_volume_claim: Some(
                 k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                    claim_name: format!("{instance_name}-filestore-pvc"),
+                    claim_name: format!("{}-filestore-pvc", instance.name_any()),
                     ..Default::default()
                 },
             ),
             ..Default::default()
         },
-        Volume {
-            name: "odoo-conf".to_string(),
-            config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
-                name: format!("{instance_name}-odoo-conf"),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
+        odoo_conf_volume(instance),
     ]
 }
 
@@ -133,12 +187,118 @@ pub fn odoo_volume_mounts() -> Vec<VolumeMount> {
             mount_path: "/var/lib/odoo".to_string(),
             ..Default::default()
         },
-        VolumeMount {
-            name: "odoo-conf".to_string(),
-            mount_path: "/etc/odoo".to_string(),
-            ..Default::default()
-        },
+        odoo_conf_mount(),
     ]
+}
+
+// ── Source volume + the command that launches Odoo ───────────────────────────
+
+/// The pod volume for `spec.sourceVolume`, or empty when unset.
+///
+/// Returned as a `Vec` so callers can `extend` unconditionally and produce a
+/// byte-identical pod spec when the field is absent.
+pub fn source_volumes(instance: &OdooInstance) -> Vec<Volume> {
+    let Some(sv) = instance.spec.source_volume.as_ref() else {
+        return vec![];
+    };
+    vec![Volume {
+        name: SOURCE_VOLUME_NAME.to_string(),
+        persistent_volume_claim: Some(
+            k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                claim_name: sv.claim_name.clone(),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    }]
+}
+
+/// The mounts for `spec.sourceVolume`, or empty when unset.
+///
+/// One `VolumeMount` per declared mount — the same claim is mounted several
+/// times so the runtime reproduces the absolute paths the source tree was
+/// built against.
+pub fn source_volume_mounts(instance: &OdooInstance) -> Vec<VolumeMount> {
+    let Some(sv) = instance.spec.source_volume.as_ref() else {
+        return vec![];
+    };
+    sv.mounts
+        .iter()
+        .map(|m| VolumeMount {
+            name: SOURCE_VOLUME_NAME.to_string(),
+            mount_path: m.mount_path.clone(),
+            sub_path: m.sub_path.clone(),
+            read_only: if m.read_only { Some(true) } else { None },
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// [`odoo_volume_mounts`] plus the source-volume mounts. Use this for every
+/// container that actually executes Odoo.
+pub fn odoo_volume_mounts_for(instance: &OdooInstance) -> Vec<VolumeMount> {
+    let mut mounts = odoo_volume_mounts();
+    mounts.extend(source_volume_mounts(instance));
+    mounts
+}
+
+/// The argv prefix that launches Odoo for this instance.
+///
+/// Without `spec.sourceVolume` this is the official image's
+/// `["/entrypoint.sh", "odoo"]` — byte-identical to what the operator has
+/// always emitted. With it, the entrypoint is bypassed in favour of running
+/// `odoo-bin` directly under `python3`.
+///
+/// The `-c` is what replaces the entrypoint's contribution. That script did
+/// two things worth keeping: it waited for PostgreSQL, and it appended
+/// `--db_host/--db_port/--db_user/--db_password` read *out of the config file
+/// at `$ODOO_RC`*. Since those four values come from the same
+/// `build_odoo_conf` output either way, naming the config file explicitly
+/// carries all of them — plus `addons_path`, `data_dir` and the rest, which
+/// the image would otherwise have supplied through its own `ODOO_RC` env var.
+/// The wait-for-postgres step is not reproduced: Odoo retries its own
+/// connection and the pod restarts on failure.
+pub fn odoo_entrypoint(instance: &OdooInstance) -> Vec<String> {
+    match instance.spec.source_volume.as_ref() {
+        None => vec!["/entrypoint.sh".to_string(), "odoo".to_string()],
+        Some(sv) => vec![
+            "python3".to_string(),
+            sv.odoo_bin.clone(),
+            "-c".to_string(),
+            ODOO_CONF_PATH.to_string(),
+        ],
+    }
+}
+
+/// [`odoo_entrypoint`] plus trailing arguments, as one argv vector.
+pub fn odoo_command(instance: &OdooInstance, args: &[&str]) -> Vec<String> {
+    let mut cmd = odoo_entrypoint(instance);
+    cmd.extend(args.iter().map(|a| a.to_string()));
+    cmd
+}
+
+/// A shell word-list that runs Odoo *without* the image entrypoint wrapper.
+///
+/// Used where the goal is to interrogate the binary rather than start a
+/// server — the entrypoint would otherwise block on `wait-for-psql.py` first.
+/// Matches the bare `odoo` upstream used for exactly that purpose.
+pub fn odoo_probe_command(instance: &OdooInstance) -> String {
+    match instance.spec.source_volume.as_ref() {
+        None => "odoo".to_string(),
+        Some(sv) => format!("python3 {}", sv.odoo_bin),
+    }
+}
+
+/// `ODOO_CMD` for the shell scripts that shell out to Odoo (`neutralize.sh`,
+/// `restore-neutralize.sh`).
+///
+/// Empty when `spec.sourceVolume` is unset: the scripts fall back to
+/// `${ODOO_CMD:-odoo}`, i.e. exactly the bare `odoo` they used before.
+pub fn odoo_cmd_env(instance: &OdooInstance) -> Vec<EnvVar> {
+    if instance.spec.source_volume.is_none() {
+        return vec![];
+    }
+    vec![env("ODOO_CMD", odoo_entrypoint(instance).join(" "))]
 }
 
 /// Build the `imagePullSecrets` list from an OdooInstance spec.
@@ -277,6 +437,7 @@ pub struct OdooJobBuilder {
     backoff_limit: Option<i32>,
     affinity: Option<Affinity>,
     labels: std::collections::BTreeMap<String, String>,
+    security_context: PodSecurityContext,
 }
 
 impl OdooJobBuilder {
@@ -292,20 +453,30 @@ impl OdooJobBuilder {
         owner: &K,
         instance: &OdooInstance,
     ) -> Self {
-        let instance_name = instance.name_any();
         Self {
             generate_name: generate_name_prefix.to_string(),
             namespace: ns.to_string(),
             owner_ref: controller_owner_ref(owner),
             pull_secrets: image_pull_secrets(instance),
-            volumes: odoo_volumes(&instance_name),
+            volumes: odoo_volumes(instance),
             containers: vec![],
             init_containers: None,
             active_deadline: None,
             backoff_limit: None,
             affinity: None,
             labels: instance_labels(instance),
+            security_context: odoo_security_context(instance),
         }
+    }
+
+    /// Attach the instance's `spec.sourceVolume` claim to the pod. No-op when
+    /// the field is unset, so job builders can call it unconditionally.
+    ///
+    /// Only the jobs whose containers actually execute Odoo need this — the
+    /// pg-client, `mc` and rsync tooling steps deliberately do not carry it.
+    pub fn with_source_volume(mut self, instance: &OdooInstance) -> Self {
+        self.volumes.extend(source_volumes(instance));
+        self
     }
 
     /// Set the main containers for the Job pod.
@@ -384,7 +555,7 @@ impl OdooJobBuilder {
                     spec: Some(PodSpec {
                         restart_policy: Some("Never".to_string()),
                         image_pull_secrets: self.pull_secrets,
-                        security_context: Some(odoo_security_context()),
+                        security_context: Some(self.security_context),
                         affinity: self.affinity,
                         volumes: Some(self.volumes),
                         init_containers: self.init_containers,

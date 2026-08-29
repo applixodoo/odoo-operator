@@ -14,7 +14,8 @@ use crate::controller::helpers::FIELD_MANAGER;
 use crate::controller::state_machine::scale_deployment;
 
 use crate::controller::helpers::{
-    apply_extra_env, cron_depl_name, odoo_volume_mounts, OdooJobBuilder,
+    apply_extra_env, cron_depl_name, odoo_entrypoint, odoo_probe_command, odoo_volume_mounts_for,
+    OdooJobBuilder,
 };
 
 /// Initializing: init job is running, deployment must be scaled down.
@@ -88,6 +89,7 @@ pub fn build_init_job(
 ) -> Job {
     OdooJobBuilder::new(&format!("{cr_name}-"), ns, init_job, instance)
         .active_deadline(3600)
+        .with_source_volume(instance)
         .containers(vec![{
             let mut odoo_args = vec![
                 "-i".to_string(),
@@ -104,21 +106,12 @@ pub fn build_init_job(
             // the binary is >= 19; on <= 18 the flag is omitted and demo loads by
             // default. The non-demo path stays a plain exec, unchanged.
             let (command, args) = if init_job.spec.demo {
-                let mut argv = vec![
-                    "maj=$(odoo --version 2>/dev/null | grep -oE '[0-9]+' | head -n1); \
-                     flag=''; [ \"${maj:-0}\" -ge 19 ] && flag='--with-demo'; \
-                     exec /entrypoint.sh odoo \"$@\" $flag"
-                        .to_string(),
-                    "sh".to_string(), // $0 for the `sh -c` invocation
-                ];
+                let mut argv = vec![demo_probe_script(instance), "sh".to_string()];
                 argv.append(&mut odoo_args);
                 (vec!["/bin/sh".to_string(), "-c".to_string()], argv)
             } else {
                 odoo_args.push("--without-demo=all".to_string());
-                (
-                    vec!["/entrypoint.sh".to_string(), "odoo".to_string()],
-                    odoo_args,
-                )
+                (odoo_entrypoint(instance), odoo_args)
             };
             apply_extra_env(
                 Container {
@@ -126,11 +119,31 @@ pub fn build_init_job(
                     image: Some(image.to_string()),
                     command: Some(command),
                     args: Some(args),
-                    volume_mounts: Some(odoo_volume_mounts()),
+                    volume_mounts: Some(odoo_volume_mounts_for(instance)),
                     ..Default::default()
                 },
                 instance,
             )
         }])
         .build()
+}
+
+/// The `sh -c` program for the demo-data init path.
+///
+/// Two *different* invocations of Odoo appear here and they are not
+/// interchangeable. The `--version` probe must reach the binary directly — put
+/// the image entrypoint in front of it and it blocks on `wait-for-psql.py`
+/// first — while the real run wants the full launch command. Hence
+/// `odoo_probe_command` for the former and `odoo_entrypoint` for the latter.
+///
+/// With no `spec.sourceVolume` this renders byte-for-byte what the operator
+/// has always emitted; `tests/controller_helpers_test.rs` pins that string.
+fn demo_probe_script(instance: &OdooInstance) -> String {
+    let probe = odoo_probe_command(instance);
+    let exec = odoo_entrypoint(instance).join(" ");
+    format!(
+        "maj=$({probe} --version 2>/dev/null | grep -oE '[0-9]+' | head -n1); \
+         flag=''; [ \"${{maj:-0}}\" -ge 19 ] && flag='--with-demo'; \
+         exec {exec} \"$@\" $flag"
+    )
 }

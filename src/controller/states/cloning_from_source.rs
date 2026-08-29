@@ -24,8 +24,9 @@ use crate::{controller::child_resources, crd::odoo_instance::OdooInstance};
 
 use super::{Context, ReconcileSnapshot, State};
 use crate::controller::helpers::{
-    apply_extra_env, cm_env, controller_owner_ref, cron_depl_name, env, odoo_volume_mounts,
-    pg_tools_image, staging_mail_env_vars, OdooJobBuilder, FIELD_MANAGER,
+    apply_extra_env, cm_env, controller_owner_ref, cron_depl_name, env, odoo_cmd_env,
+    odoo_volume_mounts, odoo_volume_mounts_for, pg_tools_image, staging_mail_env_vars,
+    OdooJobBuilder, FIELD_MANAGER,
 };
 use crate::controller::state_machine::scale_deployment;
 use crate::helpers::sha256_hex;
@@ -880,6 +881,9 @@ fn build_neutralize_job(
         cm_env("PASSWORD", target_conf, "db_password"),
     ];
     envs.extend(staging_mail_env_vars(instance, defaults));
+    // `neutralize.sh` shells out to `${ODOO_CMD:-odoo}`; this is what points it
+    // at odoo-bin on the source volume. Empty (and so a no-op) otherwise.
+    envs.extend(odoo_cmd_env(instance));
     OdooJobBuilder::new(&format!("{crd_name}-neut-"), ns, refresh, instance)
         // Neutralize is a small set of SQL UPDATEs (disable cron jobs,
         // swap ir_mail_server, blank API keys / passwords).  Realistic
@@ -895,6 +899,9 @@ fn build_neutralize_job(
         // exits) — that's the spec-drift retry path's responsibility, gated
         // on `neutralizeJobImageHash`.
         .backoff_limit(5)
+        // Neutralize executes Odoo, so it gets the source volume; the
+        // db/filestore clone steps (pg-client and rsync tooling) do not.
+        .with_source_volume(instance)
         // Neutralize runs the Odoo image; the db/filestore clone steps (pg-client
         // and rsync tooling) deliberately do not get the instance's extra env.
         .containers(vec![apply_extra_env(
@@ -907,7 +914,7 @@ fn build_neutralize_job(
                     NEUTRALIZE_SCRIPT.into(),
                 ]),
                 env: Some(envs),
-                volume_mounts: Some(odoo_volume_mounts()),
+                volume_mounts: Some(odoo_volume_mounts_for(instance)),
                 ..Default::default()
             },
             instance,

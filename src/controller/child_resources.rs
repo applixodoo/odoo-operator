@@ -23,6 +23,7 @@ use k8s_openapi::apimachinery::pkg::{
     apis::meta::v1::{LabelSelector, OwnerReference},
     util::intstr::IntOrString,
 };
+use k8s_openapi::ByteString;
 use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams, ResourceExt};
 use kube::Client;
 use serde_json::json;
@@ -41,8 +42,9 @@ use crate::helpers::{
 use crate::postgres::PostgresClusterConfig;
 
 use super::helpers::{
-    apply_extra_env, cron_depl_name, env, image_pull_secrets, odoo_security_context,
-    odoo_volume_mounts, odoo_volumes, secret_env, FIELD_MANAGER,
+    apply_extra_env, cron_depl_name, env, image_pull_secrets, odoo_command, odoo_conf_in_secret,
+    odoo_conf_name, odoo_security_context, odoo_volume_mounts_for, odoo_volumes, secret_env,
+    source_volumes, FIELD_MANAGER,
 };
 use super::odoo_instance::Context;
 
@@ -191,14 +193,64 @@ pub async fn ensure_image_pull_secret(
     Ok(())
 }
 
+/// Ensure the `<instance>-odoo-user` Secret carries the credentials Odoo
+/// should connect with.
+///
+/// Two modes, keyed off how the cluster was resolved:
+///
+///   * **Operator-owned cluster** (clusters.yaml): generate a random password
+///     once and never touch it again — the operator also creates the matching
+///     PostgreSQL role, so rotating here would desynchronise the two.
+///   * **Adopted CNPG cluster** (`pg.adopted`): mirror the cluster's `-app`
+///     credentials in on every reconcile. The role is not ours to create, and
+///     CNPG may rotate the app password, so this Secret has to follow it.
+///
+/// Mirroring into the existing Secret (rather than teaching every consumer
+/// about CNPG) is deliberate: it keeps `read_odoo_credentials`,
+/// `ensure_config_map` and every `cm_env`-fed job container unchanged.
 pub async fn ensure_odoo_user_secret(
     client: &Client,
     ns: &str,
     name: &str,
     oref: &OwnerReference,
+    pg: &PostgresClusterConfig,
 ) -> Result<()> {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
     let secret_name = format!("{name}-odoo-user");
+
+    if pg.adopted {
+        // `data` rather than `stringData`: the latter is write-only and is
+        // converted server-side, which makes a server-side-apply of it awkward
+        // to reason about. Writing the encoded form keeps this apply exactly as
+        // idempotent as the odoo-conf ConfigMap's.
+        let secret = Secret {
+            metadata: ObjectMeta {
+                name: Some(secret_name.clone()),
+                namespace: Some(ns.to_string()),
+                owner_references: Some(vec![oref.clone()]),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([
+                (
+                    "username".to_string(),
+                    ByteString(pg.admin_user.clone().into_bytes()),
+                ),
+                (
+                    "password".to_string(),
+                    ByteString(pg.admin_password.clone().into_bytes()),
+                ),
+            ])),
+            ..Default::default()
+        };
+        secrets
+            .patch(
+                &secret_name,
+                &PatchParams::apply(FIELD_MANAGER).force(),
+                &Patch::Apply(&secret),
+            )
+            .await?;
+        return Ok(());
+    }
 
     // Only create if it doesn't exist (credentials are generated once).
     match secrets.get(&secret_name).await {
@@ -228,6 +280,10 @@ pub async fn ensure_odoo_user_secret(
 
 /// Read the Odoo user credentials (username + password) from the instance's
 /// `-odoo-user` Secret.
+///
+/// A missing/empty `username` key falls back to the naming convention, which
+/// is what `ensure_odoo_user_secret` writes — so a Secret carried over from an
+/// older operator that only stored a password still resolves correctly.
 pub async fn read_odoo_credentials(
     client: &Client,
     ns: &str,
@@ -243,6 +299,11 @@ pub async fn read_odoo_credentials(
             .unwrap_or_default(),
     )
     .to_string();
+    let username = if username.is_empty() {
+        odoo_username(ns, name)
+    } else {
+        username
+    };
     let password = String::from_utf8_lossy(
         data.get("password")
             .map(|v| v.0.as_slice())
@@ -253,11 +314,20 @@ pub async fn read_odoo_credentials(
     Ok((username, password))
 }
 
+/// Create the per-instance PostgreSQL role.
+///
+/// Skipped entirely for an adopted CNPG cluster: there the database and its
+/// owning role were created by the platform through `bootstrap.initdb`, the
+/// tenant cluster has no superuser, and the app role holds neither CREATEROLE
+/// nor ADMIN OPTION on itself — so any attempt here fails permanently.
 pub async fn ensure_postgres_role(
     ctx: &Context,
     instance: &OdooInstance,
     pg: &PostgresClusterConfig,
 ) -> Result<()> {
+    if pg.adopted {
+        return Ok(());
+    }
     let ns = instance.namespace().unwrap_or_default();
     let name = instance.name_any();
     let (username, password) = read_odoo_credentials(&ctx.client, &ns, &name).await?;
@@ -454,6 +524,67 @@ async fn get_pvc_source(
     })
 }
 
+/// Resolve the Odoo master password from whichever of the two sources the
+/// spec declares.
+///
+/// Exactly one is guaranteed set by the CRD's CEL rules, but this is
+/// fail-closed rather than trusting admission: a CR that somehow reaches the
+/// controller with neither (e.g. applied while the CRD was mid-upgrade) errors
+/// out instead of silently rendering a passwordless odoo.conf.
+pub async fn resolve_admin_password(
+    client: &Client,
+    ns: &str,
+    instance: &OdooInstance,
+) -> Result<String> {
+    if let Some(ref plain) = instance.spec.admin_password {
+        return Ok(plain.clone());
+    }
+    let Some(ref r) = instance.spec.admin_password_secret_ref else {
+        return Err(crate::error::Error::config(
+            "neither spec.adminPassword nor spec.adminPasswordSecretRef is set",
+        ));
+    };
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+    let secret = secrets.get(&r.name).await.map_err(|e| {
+        crate::error::Error::config(format!(
+            "reading spec.adminPasswordSecretRef secret {:?}: {e}",
+            r.name
+        ))
+    })?;
+    let raw = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get(&r.key))
+        .map(|v| v.0.clone())
+        .or_else(|| {
+            secret
+                .string_data
+                .as_ref()
+                .and_then(|d| d.get(&r.key))
+                .map(|s| s.clone().into_bytes())
+        })
+        .ok_or_else(|| {
+            crate::error::Error::config(format!(
+                "secret {:?} has no key {:?} (spec.adminPasswordSecretRef)",
+                r.name, r.key
+            ))
+        })?;
+    Ok(String::from_utf8_lossy(&raw).to_string())
+}
+
+/// Render odoo.conf and publish it, plus the flat `db_*` keys that job
+/// containers read through `cm_env`.
+///
+/// The ConfigMap is always written — the `db_*` keys are what the backup,
+/// restore, clone and migrate jobs consume, and dropping it would break them.
+/// What varies is where the *conf file the pods mount* lives:
+///
+///   * `spec.adminPassword` (default): the ConfigMap's `odoo.conf` carries
+///     `admin_passwd`, exactly as upstream, and the pods mount the ConfigMap.
+///   * `spec.adminPasswordSecretRef`: `admin_passwd` is stripped from the
+///     ConfigMap's copy and the full conf is written to a same-named Secret,
+///     which is what the pods mount instead. The master password therefore
+///     never lands in a ConfigMap.
 pub async fn ensure_config_map(
     client: &Client,
     ns: &str,
@@ -463,30 +594,41 @@ pub async fn ensure_config_map(
     oref: &OwnerReference,
 ) -> Result<()> {
     let cms: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
-    let cm_name = format!("{name}-odoo-conf");
-    let username = odoo_username(ns, name);
+    let cm_name = odoo_conf_name(name);
     let db = db_name(instance);
 
-    // Read password from the odoo-user secret.
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
-    let secret = secrets.get(&format!("{name}-odoo-user")).await?;
-    let data = secret.data.unwrap_or_default();
-    let password = String::from_utf8_lossy(
-        data.get("password")
-            .map(|v| v.0.as_slice())
-            .unwrap_or_default(),
-    )
-    .to_string();
+    // Credentials come from the odoo-user secret. In adopted-CNPG mode that
+    // secret mirrors the cluster's app credentials, so the username has to be
+    // read from it rather than re-derived from the naming convention.
+    let (username, password) = read_odoo_credentials(client, ns, name).await?;
 
-    let conf = build_odoo_conf(
+    let admin_password = resolve_admin_password(client, ns, instance).await?;
+    let conf_with_admin = build_odoo_conf(
         &username,
         &password,
-        &instance.spec.admin_password,
+        &admin_password,
         &pg.host,
         pg.port,
         &db,
         &instance.spec.config_options,
     );
+
+    let in_secret = odoo_conf_in_secret(instance);
+    // The ConfigMap copy omits admin_passwd in Secret mode. Rendering it with
+    // an empty admin password is what omits the key — see `build_odoo_conf`.
+    let cm_conf = if in_secret {
+        build_odoo_conf(
+            &username,
+            &password,
+            "",
+            &pg.host,
+            pg.port,
+            &db,
+            &instance.spec.config_options,
+        )
+    } else {
+        conf_with_admin.clone()
+    };
 
     let cm = ConfigMap {
         metadata: ObjectMeta {
@@ -496,7 +638,7 @@ pub async fn ensure_config_map(
             ..Default::default()
         },
         data: Some(BTreeMap::from([
-            ("odoo.conf".to_string(), conf),
+            ("odoo.conf".to_string(), cm_conf),
             ("db_host".to_string(), pg.host.clone()),
             ("db_port".to_string(), pg.port.to_string()),
             ("db_name".to_string(), db),
@@ -512,7 +654,67 @@ pub async fn ensure_config_map(
         &Patch::Apply(&cm),
     )
     .await?;
+
+    if in_secret {
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+        let sec = Secret {
+            metadata: ObjectMeta {
+                name: Some(cm_name.clone()),
+                namespace: Some(ns.to_string()),
+                owner_references: Some(vec![oref.clone()]),
+                ..Default::default()
+            },
+            // `data`, not `stringData` — see `ensure_odoo_user_secret`.
+            data: Some(BTreeMap::from([(
+                "odoo.conf".to_string(),
+                ByteString(conf_with_admin.into_bytes()),
+            )])),
+            ..Default::default()
+        };
+        secrets
+            .patch(
+                &cm_name,
+                &PatchParams::apply(FIELD_MANAGER).force(),
+                &Patch::Apply(&sec),
+            )
+            .await?;
+    }
     Ok(())
+}
+
+/// The rendered odoo.conf as the pods will see it, for the rollout-trigger
+/// hash. Reads whichever object [`ensure_config_map`] made authoritative.
+///
+/// Hashing the *mounted* copy is what makes a master-password change roll the
+/// pods in Secret mode — the ConfigMap copy has `admin_passwd` stripped, so
+/// hashing it would miss the change entirely.
+pub async fn read_odoo_conf_for_hash(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    instance: &OdooInstance,
+) -> Result<String> {
+    let obj_name = odoo_conf_name(name);
+    if odoo_conf_in_secret(instance) {
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+        let sec = secrets.get(&obj_name).await?;
+        return Ok(String::from_utf8_lossy(
+            sec.data
+                .as_ref()
+                .and_then(|d| d.get("odoo.conf"))
+                .map(|v| v.0.as_slice())
+                .unwrap_or_default(),
+        )
+        .to_string());
+    }
+    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
+    let cm = cms.get(&obj_name).await?;
+    Ok(cm
+        .data
+        .as_ref()
+        .and_then(|d| d.get("odoo.conf"))
+        .cloned()
+        .unwrap_or_default())
 }
 
 pub async fn ensure_service(
@@ -705,15 +907,7 @@ pub async fn ensure_deployment(
         .unwrap_or("/web/health");
 
     // Hash odoo.conf for rollout trigger.
-    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
-    let cm = cms.get(&format!("{name}-odoo-conf")).await?;
-    let conf_content = cm
-        .data
-        .as_ref()
-        .and_then(|d| d.get("odoo.conf"))
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    let conf_hash = sha256_hex(conf_content);
+    let conf_hash = sha256_hex(&read_odoo_conf_for_hash(client, ns, name, instance).await?);
 
     // Override PGDATABASE so the Odoo config layer (which reads env vars
     // with higher priority than the config file) uses the correct database.
@@ -773,19 +967,18 @@ pub async fn ensure_deployment(
                     } else {
                         Some(instance.spec.tolerations.clone())
                     },
-                    security_context: Some(odoo_security_context()),
-                    volumes: Some(odoo_volumes(name)),
+                    security_context: Some(odoo_security_context(instance)),
+                    volumes: Some({
+                        let mut v = odoo_volumes(instance);
+                        v.extend(source_volumes(instance));
+                        v
+                    }),
                     containers: vec![apply_extra_env(
                         Container {
                             name: format!("odoo-{name}"),
                             image: Some(image.to_string()),
                             image_pull_policy: Some("IfNotPresent".to_string()),
-                            command: Some(vec![
-                                "/entrypoint.sh".to_string(),
-                                "odoo".to_string(),
-                                "--max-cron-threads".to_string(),
-                                "0".to_string(),
-                            ]),
+                            command: Some(odoo_command(instance, &["--max-cron-threads", "0"])),
                             ports: Some(vec![
                                 ContainerPort {
                                     name: Some("http".to_string()),
@@ -799,7 +992,7 @@ pub async fn ensure_deployment(
                                 },
                             ]),
                             env: Some(pg_env),
-                            volume_mounts: Some(odoo_volume_mounts()),
+                            volume_mounts: Some(odoo_volume_mounts_for(instance)),
                             resources: instance.spec.resources.clone(),
                             startup_probe: Some(Probe {
                                 initial_delay_seconds: Some(5),
@@ -1001,15 +1194,7 @@ pub async fn ensure_cron_deployment(
     let pg_env = vec![env("PGDATABASE", &db)];
 
     // Hash odoo.conf for rollout trigger.
-    let cms: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
-    let cm = cms.get(&format!("{name}-odoo-conf")).await?;
-    let conf_content = cm
-        .data
-        .as_ref()
-        .and_then(|d| d.get("odoo.conf"))
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    let conf_hash = sha256_hex(conf_content);
+    let conf_hash = sha256_hex(&read_odoo_conf_for_hash(client, ns, name, instance).await?);
 
     let mut depl_labels = BTreeMap::from([("app".to_string(), depl_name.to_string())]);
     depl_labels.extend(super::helpers::instance_labels(instance));
@@ -1050,8 +1235,12 @@ pub async fn ensure_cron_deployment(
                     } else {
                         Some(instance.spec.tolerations.clone())
                     },
-                    security_context: Some(odoo_security_context()),
-                    volumes: Some(odoo_volumes(name)),
+                    security_context: Some(odoo_security_context(instance)),
+                    volumes: Some({
+                        let mut v = odoo_volumes(instance);
+                        v.extend(source_volumes(instance));
+                        v
+                    }),
                     containers: vec![{
                         // Cron pods run --no-http so there is no HTTP endpoint
                         // for probes.  Instead we query PostgreSQL directly to
@@ -1073,15 +1262,12 @@ pub async fn ensure_cron_deployment(
                                 name: format!("odoo-cron-{name}"),
                                 image: Some(image.to_string()),
                                 image_pull_policy: Some("IfNotPresent".to_string()),
-                                command: Some(vec![
-                                    "/entrypoint.sh".to_string(),
-                                    "odoo".to_string(),
-                                    "--workers".to_string(),
-                                    "0".to_string(),
-                                    "--no-http".to_string(),
-                                ]),
+                                command: Some(odoo_command(
+                                    instance,
+                                    &["--workers", "0", "--no-http"],
+                                )),
                                 env: Some(pg_env),
-                                volume_mounts: Some(odoo_volume_mounts()),
+                                volume_mounts: Some(odoo_volume_mounts_for(instance)),
                                 resources: instance.spec.cron.resources.clone(),
                                 startup_probe: Some(Probe {
                                     initial_delay_seconds: Some(5),

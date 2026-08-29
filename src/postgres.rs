@@ -5,15 +5,30 @@ use tracing::{debug, info, warn};
 use crate::error::Result;
 
 /// Per-cluster entry from the postgres-clusters Secret.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresClusterConfig {
     pub host: String,
     pub port: i32,
+    /// The role the operator connects as. For a clusters.yaml entry this is a
+    /// privileged administrative role; for an adopted CNPG cluster it is the
+    /// database's own app role, which is all the tenant has.
     pub admin_user: String,
     pub admin_password: String,
     #[serde(default)]
     pub default: bool,
+
+    /// True when this config was resolved from a `postgresql.cnpg.io/v1`
+    /// Cluster living in the instance's own namespace, rather than from the
+    /// operator's clusters.yaml Secret.
+    ///
+    /// Such a cluster is *adopted*, not managed: the database and its owning
+    /// role already exist (created by the platform through `bootstrap.initdb`)
+    /// and there is no superuser, so the operator must not attempt role or
+    /// database creation — or role deletion on teardown. Never deserialized
+    /// from YAML; set only by the resolver.
+    #[serde(default, skip)]
+    pub adopted: bool,
 }
 
 /// Parameters for provisioning a read-only Postgres role on a tenant database.

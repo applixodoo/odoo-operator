@@ -7,7 +7,8 @@ use tracing::info;
 
 use super::{Context, ReconcileSnapshot, State};
 use crate::controller::helpers::{
-    apply_extra_env, cron_depl_name, odoo_volume_mounts, OdooJobBuilder, FIELD_MANAGER,
+    apply_extra_env, cron_depl_name, odoo_entrypoint, odoo_volume_mounts_for, OdooJobBuilder,
+    FIELD_MANAGER,
 };
 use crate::controller::state_machine::scale_deployment;
 use crate::crd::odoo_instance::OdooInstance;
@@ -74,13 +75,14 @@ impl State for Upgrading {
 
         let job = OdooJobBuilder::new(&format!("{crd_name}-"), &ns, upgrade_job, instance)
             .active_deadline(3600)
+            .with_source_volume(instance)
             .containers(vec![apply_extra_env(
                 Container {
                     name: "odoo-upgrade".into(),
                     image: Some(image.into()),
-                    command: Some(vec!["/entrypoint.sh".into(), "odoo".into()]),
+                    command: Some(odoo_entrypoint(instance)),
                     args: Some(args),
-                    volume_mounts: Some(odoo_volume_mounts()),
+                    volume_mounts: Some(odoo_volume_mounts_for(instance)),
                     ..Default::default()
                 },
                 instance,

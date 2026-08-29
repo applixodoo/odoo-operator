@@ -323,7 +323,7 @@ async fn reconcile_instance(instance: &OdooInstance, ctx: &Context) -> Result<Ac
     let oref = controller_owner_ref(instance);
     child_resources::ensure_image_pull_secret(client, &ns, instance, &ctx.operator_namespace)
         .await?;
-    child_resources::ensure_odoo_user_secret(client, &ns, &name, &oref).await?;
+    child_resources::ensure_odoo_user_secret(client, &ns, &name, &oref, &pg_cluster).await?;
     child_resources::ensure_postgres_role(ctx, instance, &pg_cluster).await?;
     let current_phase_ref = instance.status.as_ref().and_then(|s| s.phase.as_ref());
     let is_migrating_filestore = matches!(
@@ -649,6 +649,16 @@ async fn cleanup_instance(instance: &OdooInstance, ctx: &Context) -> Result<Acti
 
     let username = odoo_username(&ns, &name);
     if let Ok((cluster_name, pg_cluster)) = load_postgres_cluster(ctx, instance).await {
+        // An adopted CNPG cluster's role and database belong to the platform
+        // that created them, not to this operator. Dropping them here would
+        // destroy data the operator never provisioned — and would fail anyway,
+        // since the app role cannot drop itself. The Cluster's own lifecycle
+        // is what reclaims that storage.
+        if pg_cluster.adopted {
+            info!(%name, %cluster_name, "adopted cluster — skipping postgres role cleanup");
+            return Ok(Action::await_change());
+        }
+
         // Best-effort: clean up the read-only role before the owner role so we
         // don't leave orphaned grants.  Non-fatal — the owner role drop is what
         // the finalizer must guarantee; the RO role has no owned databases.
@@ -797,23 +807,154 @@ async fn load_all_postgres_clusters(
     Ok(serde_yaml::from_str(&yaml_str)?)
 }
 
+/// GroupVersionKind of a CloudNativePG `Cluster`.
+///
+/// Resolved dynamically rather than by vendoring the CNPG types: the operator
+/// only ever needs to know whether the object exists, and a `DynamicObject`
+/// get avoids a dependency on a CNPG schema that would then have to track
+/// their releases.
+fn cnpg_cluster_gvk() -> kube::core::GroupVersionKind {
+    kube::core::GroupVersionKind::gvk("postgresql.cnpg.io", "v1", "Cluster")
+}
+
+/// Try to resolve `cluster_name` as a CloudNativePG `Cluster` living in the
+/// instance's **own** namespace.
+///
+/// This is the adopt path: the platform pre-creates the Cluster, its database
+/// and the owning app role, so all the operator needs is a connection. CNPG's
+/// conventions give both without any CNPG-specific types — the read-write
+/// Service is `<cluster>-rw.<ns>.svc.cluster.local:5432` and the app
+/// credentials live in the `<cluster>-app` Secret — so the Cluster itself is
+/// fetched as an untyped `DynamicObject` purely to answer "does it exist?".
+///
+/// Returns `Ok(None)` when no such Cluster exists (or the CRD is not installed
+/// at all), which is what makes the clusters.yaml fallback unconditional.
+async fn resolve_namespaced_cnpg_cluster(
+    ctx: &Context,
+    ns: &str,
+    cluster_name: &str,
+) -> Result<Option<PostgresClusterConfig>> {
+    use kube::api::DynamicObject;
+    use kube::discovery::ApiResource;
+
+    let ar = ApiResource::from_gvk(&cnpg_cluster_gvk());
+    let clusters: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &ar);
+    match clusters.get(cluster_name).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(ref e)) if e.code == 404 => return Ok(None),
+        Err(e) => {
+            // A missing CNPG CRD surfaces as 404 on the collection rather than
+            // the object; anything else (RBAC, apiserver down) is worth
+            // logging but must still fall back rather than wedge the instance.
+            debug!(%ns, %cluster_name, %e, "CNPG Cluster lookup failed; falling back to clusters.yaml");
+            return Ok(None);
+        }
+    }
+
+    let app_secret_name = cnpg_app_secret_name(cluster_name);
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), ns);
+    let secret = secrets.get(&app_secret_name).await.map_err(|e| {
+        Error::config(format!(
+            "CNPG Cluster {cluster_name:?} exists in namespace {ns:?} but its app \
+             credentials Secret {app_secret_name:?} could not be read: {e}"
+        ))
+    })?;
+    let data: BTreeMap<String, Vec<u8>> = secret
+        .data
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, v.0))
+        .collect();
+
+    let cfg = cnpg_config_from_app_secret(cluster_name, ns, &data)?;
+    info!(
+        %ns, %cluster_name, host = %cfg.host, user = %cfg.admin_user,
+        "adopted namespaced CNPG cluster; skipping role and database creation"
+    );
+    Ok(Some(cfg))
+}
+
+/// Name of the app-credentials Secret CNPG creates alongside a Cluster.
+pub fn cnpg_app_secret_name(cluster_name: &str) -> String {
+    format!("{cluster_name}-app")
+}
+
+/// Map a CNPG `<cluster>-app` Secret onto a [`PostgresClusterConfig`].
+///
+/// The credentials in that Secret belong to the database's own **app role** —
+/// the tenant cluster has no superuser — so they land in `admin_user` /
+/// `admin_password`, which is simply "the identity the operator connects as".
+/// Everything downstream (`ensure_extensions`, `database_exists`, the
+/// odoo.conf render) then works unchanged; the `adopted` flag is what tells
+/// the role- and database-creating paths to stand down.
+///
+/// `host`/`port` prefer the Secret's own keys, which modern CNPG populates,
+/// and otherwise fall back to CNPG's documented Service convention so a Secret
+/// written by an older release still resolves.
+pub fn cnpg_config_from_app_secret(
+    cluster_name: &str,
+    ns: &str,
+    data: &BTreeMap<String, Vec<u8>>,
+) -> Result<PostgresClusterConfig> {
+    let secret_name = cnpg_app_secret_name(cluster_name);
+    let get = |k: &str| {
+        data.get(k)
+            .map(|v| String::from_utf8_lossy(v).to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let admin_user = get("username")
+        .ok_or_else(|| Error::config(format!("secret {secret_name:?} has no 'username' key")))?;
+    let admin_password = get("password")
+        .ok_or_else(|| Error::config(format!("secret {secret_name:?} has no 'password' key")))?;
+
+    Ok(PostgresClusterConfig {
+        host: get("host").unwrap_or_else(|| format!("{cluster_name}-rw.{ns}.svc.cluster.local")),
+        port: get("port")
+            .and_then(|p| p.parse::<i32>().ok())
+            .unwrap_or(5432),
+        admin_user,
+        admin_password,
+        default: false,
+        adopted: true,
+    })
+}
+
 /// Resolve the postgres cluster for the given instance (spec.database.cluster or default).
+///
+/// Resolution order for a named cluster:
+///   1. A `postgresql.cnpg.io/v1` Cluster of that name in the instance's own
+///      namespace — adopted, credentials from its `-app` Secret.
+///   2. The operator's clusters.yaml Secret — the original behaviour, reached
+///      whenever step 1 finds nothing.
+///
+/// An unset `spec.database.cluster` goes straight to the clusters.yaml default,
+/// unchanged.
 pub async fn load_postgres_cluster(
     ctx: &Context,
     instance: &OdooInstance,
 ) -> Result<(String, PostgresClusterConfig)> {
+    // If spec.database.cluster is set, use it directly.
+    let named = instance
+        .spec
+        .database
+        .as_ref()
+        .and_then(|d| d.cluster.as_deref())
+        .filter(|c| !c.is_empty());
+
+    if let Some(cluster_name) = named {
+        let ns = instance.namespace().unwrap_or_default();
+        if let Some(cfg) = resolve_namespaced_cnpg_cluster(ctx, &ns, cluster_name).await? {
+            return Ok((cluster_name.to_string(), cfg));
+        }
+    }
+
     let clusters = load_all_postgres_clusters(ctx).await?;
 
-    // If spec.database.cluster is set, use it directly.
-    if let Some(ref db) = instance.spec.database {
-        if let Some(ref cluster_name) = db.cluster {
-            if !cluster_name.is_empty() {
-                let cfg = clusters.get(cluster_name).ok_or_else(|| {
-                    Error::config(format!("postgres cluster {cluster_name:?} not found"))
-                })?;
-                return Ok((cluster_name.clone(), cfg.clone()));
-            }
-        }
+    if let Some(cluster_name) = named {
+        let cfg = clusters
+            .get(cluster_name)
+            .ok_or_else(|| Error::config(format!("postgres cluster {cluster_name:?} not found")))?;
+        return Ok((cluster_name.to_string(), cfg.clone()));
     }
 
     // Otherwise find the default.

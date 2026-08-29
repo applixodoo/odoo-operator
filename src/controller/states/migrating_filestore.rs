@@ -233,7 +233,7 @@ fn build_rsync_job(inst_name: &str, ns: &str, instance: &OdooInstance) -> Job {
                 }),
                 spec: Some(PodSpec {
                     restart_policy: Some("Never".to_string()),
-                    security_context: Some(super::super::helpers::odoo_security_context()),
+                    security_context: Some(super::super::helpers::odoo_security_context(instance)),
                     image_pull_secrets: super::super::helpers::image_pull_secrets(instance),
                     containers: vec![Container {
                         name: "rsync".to_string(),

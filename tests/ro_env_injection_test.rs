@@ -22,7 +22,8 @@ fn make_instance(name: &str, ro: Option<ReadOnlySqlAccessSpec>) -> OdooInstance 
         spec: OdooInstanceSpec {
             image: None,
             image_pull_secret: None,
-            admin_password: "admin".to_string(),
+            admin_password: Some("admin".to_string()),
+            admin_password_secret_ref: None,
             replicas: 1,
             cron: CronSpec::default(),
             ingress: IngressSpec {
@@ -46,6 +47,9 @@ fn make_instance(name: &str, ro: Option<ReadOnlySqlAccessSpec>) -> OdooInstance 
             read_only_sql_access: ro,
             extra_env: vec![],
             extra_env_from: vec![],
+            source_volume: None,
+            run_as_user: None,
+            run_as_group: None,
         },
         status: None,
     }

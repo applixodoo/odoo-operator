@@ -19,6 +19,13 @@
 # Required env vars:
 #   HOST, PORT, USER, PASSWORD — PostgreSQL connection
 #   DB_NAME                    — target database name
+#
+# Optional env vars:
+#   ODOO_CMD  — how to invoke Odoo.  Defaults to `odoo`, i.e. the executable on
+#               PATH in the official image.  The operator sets it (to something
+#               like `python3 /work/.../odoo-bin -c /etc/odoo/odoo.conf`) when
+#               spec.sourceVolume puts the Odoo source on a volume instead.
+#               Intentionally unquoted below so a multi-word value splits.
 
 set -euo pipefail
 export PGPASSWORD=$PASSWORD
@@ -49,7 +56,7 @@ END $body$;
 EOSQL
 
 echo "=== Running odoo neutralize ==="
-odoo neutralize \
+${ODOO_CMD:-odoo} neutralize \
     --db_host "$HOST" --db_port "$PORT" \
     --db_user "$USER" --db_password "$PASSWORD" \
     -d "$DB_NAME"

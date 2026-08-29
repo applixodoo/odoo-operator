@@ -19,7 +19,8 @@ fn test_instance(name: &str, pull_secret: Option<&str>) -> OdooInstance {
         spec: OdooInstanceSpec {
             image: None,
             image_pull_secret: pull_secret.map(|s| s.to_string()),
-            admin_password: "admin".to_string(),
+            admin_password: Some("admin".to_string()),
+            admin_password_secret_ref: None,
             replicas: 1,
             cron: CronSpec {
                 replicas: 1,
@@ -46,6 +47,9 @@ fn test_instance(name: &str, pull_secret: Option<&str>) -> OdooInstance {
             read_only_sql_access: None,
             extra_env: vec![],
             extra_env_from: vec![],
+            source_volume: None,
+            run_as_user: None,
+            run_as_group: None,
         },
         status: None,
     }
@@ -111,7 +115,8 @@ fn test_controller_owner_ref_missing_uid_defaults_to_empty() {
 
 #[test]
 fn test_odoo_security_context_values() {
-    let ctx = odoo_security_context();
+    let inst = test_instance("my-odoo", None);
+    let ctx = odoo_security_context(&inst);
     assert_eq!(ctx.run_as_user, Some(100));
     assert_eq!(ctx.run_as_group, Some(101));
     assert_eq!(ctx.fs_group, Some(101));
@@ -121,7 +126,8 @@ fn test_odoo_security_context_values() {
 
 #[test]
 fn test_odoo_volumes_names_and_sources() {
-    let vols = odoo_volumes("my-odoo");
+    let inst = test_instance("my-odoo", None);
+    let vols = odoo_volumes(&inst);
     assert_eq!(vols.len(), 2);
 
     // Filestore PVC volume

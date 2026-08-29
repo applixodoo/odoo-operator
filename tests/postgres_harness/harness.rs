@@ -142,6 +142,7 @@ pub fn cluster_config() -> PostgresClusterConfig {
         admin_user: ADMIN_USER.to_string(),
         admin_password: ADMIN_PASSWORD.to_string(),
         default: true,
+        adopted: false,
     }
 }
 

@@ -228,7 +228,7 @@ fn build_migration_job(
                 }),
                 spec: Some(PodSpec {
                     restart_policy: Some("Never".to_string()),
-                    security_context: Some(odoo_security_context()),
+                    security_context: Some(odoo_security_context(instance)),
                     image_pull_secrets: image_pull_secrets(instance),
                     containers: vec![Container {
                         name: "migrate-db".to_string(),

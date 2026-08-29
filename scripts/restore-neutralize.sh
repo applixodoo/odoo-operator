@@ -16,6 +16,11 @@
 #   DB_NAME                    — target database
 # Optional env vars:
 #   MAIL_SMTP_HOST, MAIL_SMTP_PORT, MAIL_SMTP_ENCRYPTION
+#   ODOO_CMD  — how to invoke Odoo.  Defaults to `odoo`, i.e. the executable on
+#               PATH in the official image.  The operator sets it (to something
+#               like `python3 /work/.../odoo-bin -c /etc/odoo/odoo.conf`) when
+#               spec.sourceVolume puts the Odoo source on a volume instead.
+#               Intentionally unquoted below so a multi-word value splits.
 
 set -eu
 export PGPASSWORD=$PASSWORD
@@ -32,7 +37,7 @@ cleanup_on_failure() {
 trap cleanup_on_failure EXIT
 
 echo "=== Running odoo neutralize ==="
-odoo neutralize \
+${ODOO_CMD:-odoo} neutralize \
     --db_host "$HOST" --db_port "$PORT" \
     --db_user "$USER" --db_password "$PASSWORD" \
     -d "$DB_NAME"
