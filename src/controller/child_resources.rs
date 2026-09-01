@@ -1250,16 +1250,19 @@ pub async fn ensure_cron_deployment(
                         // Cron pods run --no-http so there is no HTTP endpoint
                         // for probes.  Instead we query PostgreSQL directly to
                         // detect a stuck cron system.
-                        // See scripts/cron_{startup,liveness}_probe.py.
                         let startup_cmd = vec![
-                            "python3".to_string(),
-                            "-c".to_string(),
-                            include_str!("../../scripts/cron_startup_probe.py").to_string(),
+                            "/usr/bin/python3".to_string(),
+                            "-I".to_string(),
+                            "-S".to_string(),
+                            "/usr/local/bin/dsh-cron-probe".to_string(),
+                            "startup".to_string(),
                         ];
                         let liveness_cmd = vec![
-                            "python3".to_string(),
-                            "-c".to_string(),
-                            include_str!("../../scripts/cron_liveness_probe.py").to_string(),
+                            "/usr/bin/python3".to_string(),
+                            "-I".to_string(),
+                            "-S".to_string(),
+                            "/usr/local/bin/dsh-cron-probe".to_string(),
+                            "liveness".to_string(),
                         ];
 
                         apply_extra_env(

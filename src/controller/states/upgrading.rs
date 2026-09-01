@@ -83,6 +83,7 @@ impl State for Upgrading {
                     command: Some(odoo_entrypoint(instance)),
                     args: Some(args),
                     volume_mounts: Some(odoo_volume_mounts_for(instance)),
+                    resources: instance.spec.resources.clone(),
                     ..Default::default()
                 },
                 instance,

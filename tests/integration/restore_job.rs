@@ -1,4 +1,5 @@
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::batch::v1::Job;
 use kube::api::{Api, PostParams};
 use serde_json::json;
 
@@ -16,6 +17,15 @@ async fn restore_job_lifecycle() -> anyhow::Result<()> {
         wait_for_phase(c, ns, "test-restore", OdooInstancePhase::Uninitialized).await,
         "expected Uninitialized"
     );
+
+    let resources = source_job_resources();
+    patch_instance_spec(
+        c,
+        ns,
+        "test-restore",
+        source_runtime_patch(Some(&resources), "restore"),
+    )
+    .await;
 
     let restore_api: Api<OdooRestoreJob> = Api::namespaced(c.clone(), ns);
     let restore_job: OdooRestoreJob = serde_json::from_value(json!({
@@ -63,6 +73,10 @@ async fn restore_job_lifecycle() -> anyhow::Result<()> {
     );
 
     let k8s_job = wait_for_k8s_job_name::<OdooRestoreJob>(c, ns, "test-restore-job").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    let rendered = jobs.get(&k8s_job).await?;
+    assert_source_job_container(&rendered, "neutralize", Some(&resources), "restore");
+    assert_init_containers_have_no_resources(&rendered);
     fake_job_succeeded(c, ns, &k8s_job).await;
 
     assert!(
@@ -107,6 +121,13 @@ async fn failed_restore_transitions_to_uninitialized() -> anyhow::Result<()> {
 
     // Bring the instance to Running first so dbInitialized=true, web+cron up.
     let ready_handle = fast_track_to_running(&ctx, "test-restore-fail-init").await;
+    patch_instance_spec(
+        c,
+        ns,
+        "test-restore-fail",
+        source_runtime_patch(None, "restore-none"),
+    )
+    .await;
 
     let restore_api: Api<OdooRestoreJob> = Api::namespaced(c.clone(), ns);
     let restore_job: OdooRestoreJob = serde_json::from_value(json!({
@@ -137,6 +158,10 @@ async fn failed_restore_transitions_to_uninitialized() -> anyhow::Result<()> {
     );
 
     let k8s_job = wait_for_k8s_job_name::<OdooRestoreJob>(c, ns, "test-restore-fail-job").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    let rendered = jobs.get(&k8s_job).await?;
+    assert_source_job_container(&rendered, "neutralize", None, "restore-none");
+    assert_init_containers_have_no_resources(&rendered);
     fake_job_failed(c, ns, &k8s_job).await;
 
     assert!(

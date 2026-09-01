@@ -282,6 +282,7 @@ impl State for Restoring {
                     ]),
                     env: Some(neut_env),
                     volume_mounts: neut_mounts,
+                    resources: instance.spec.resources.clone(),
                     ..Default::default()
                 },
                 instance,

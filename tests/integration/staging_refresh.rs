@@ -58,6 +58,7 @@ async fn staging_refresh_happy_path() -> anyhow::Result<()> {
     let source_ready = fast_track_to_running(&ctx, "source-init").await;
 
     // Target OdooInstance: same namespace (v1 constraint), init disabled.
+    let resources = source_job_resources();
     let target: OdooInstance = serde_json::from_value(json!({
         "apiVersion": "bemade.org/v1alpha1",
         "kind": "OdooInstance",
@@ -74,6 +75,16 @@ async fn staging_refresh_happy_path() -> anyhow::Result<()> {
             },
             "filestore": { "storageSize": "1Gi", "storageClass": "standard" },
             "init": { "enabled": false },
+            "resources": resources,
+            "sourceVolume": {
+                "claimName": "source-artifacts",
+                "mounts": [
+                    { "mountPath": "/work" },
+                    { "mountPath": "/build", "subPath": "build" },
+                ],
+                "odooBin": "/work/instances/prod/odoo/odoo-bin",
+            },
+            "extraEnv": [{ "name": "SOURCE_JOB_SENTINEL", "value": "refresh" }],
         }
     }))
     .unwrap();
@@ -108,6 +119,8 @@ async fn staging_refresh_happy_path() -> anyhow::Result<()> {
     let db_job = wait_for_refresh_sub_job(c, ns, "target-refresh", "dbJobName").await;
     let fs_job = wait_for_refresh_sub_job(c, ns, "target-refresh", "filestoreJobName").await;
     let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    assert_job_containers_have_no_resources(&jobs.get(&db_job).await?);
+    assert_job_containers_have_no_resources(&jobs.get(&fs_job).await?);
     let succeed = |job_name: String| {
         let jobs = jobs.clone();
         async move {
@@ -132,6 +145,8 @@ async fn staging_refresh_happy_path() -> anyhow::Result<()> {
 
     // Neutralize Job spawns after both succeed.
     let neut_job = wait_for_refresh_sub_job(c, ns, "target-refresh", "neutralizeJobName").await;
+    let rendered = jobs.get(&neut_job).await?;
+    assert_source_job_container(&rendered, "neutralize", Some(&resources), "refresh");
     succeed(neut_job).await;
 
     // Transition: CloningFromSource → Starting, dbInitialized=true.
@@ -268,6 +283,15 @@ async fn staging_refresh_survives_subjob_gc() -> anyhow::Result<()> {
             },
             "filestore": { "storageSize": "1Gi", "storageClass": "standard" },
             "init": { "enabled": false },
+            "sourceVolume": {
+                "claimName": "source-artifacts",
+                "mounts": [
+                    { "mountPath": "/work" },
+                    { "mountPath": "/build", "subPath": "build" },
+                ],
+                "odooBin": "/work/instances/prod/odoo/odoo-bin",
+            },
+            "extraEnv": [{ "name": "SOURCE_JOB_SENTINEL", "value": "refresh-none" }],
         }
     }))
     .unwrap();
@@ -339,6 +363,8 @@ async fn staging_refresh_survives_subjob_gc() -> anyhow::Result<()> {
     // Step 5: neutralize Job spawns iff db_done && fs_done held true,
     // proving the recorded phase carried the DB clone's success forward.
     let neut_job = wait_for_refresh_sub_job(c, ns, "tgt-gc-refresh", "neutralizeJobName").await;
+    let rendered = jobs.get(&neut_job).await?;
+    assert_source_job_container(&rendered, "neutralize", None, "refresh-none");
     jobs.patch_status(
         &neut_job,
         &PatchParams::apply("odoo-operator-test"),

@@ -456,6 +456,57 @@ fn init_job_mounts_the_source_volume_only_when_configured() {
     assert_eq!(mounts.len(), 4, "filestore + odoo-conf + /work + /build");
 }
 
+#[test]
+fn init_source_entrypoint_inherits_instance_resources() {
+    let mut inst = with_source_volume(base_instance("prod"));
+    let expected: k8s_openapi::api::core::v1::ResourceRequirements =
+        serde_json::from_value(serde_json::json!({
+            "requests": {
+                "cpu": "731m",
+                "memory": "1537Mi",
+                "ephemeral-storage": "31Gi",
+            },
+            "limits": {
+                "cpu": "1103m",
+                "memory": "2053Mi",
+                "ephemeral-storage": "32Gi",
+            },
+        }))
+        .unwrap();
+    inst.spec.resources = Some(expected.clone());
+    inst.spec.extra_env = vec![k8s_openapi::api::core::v1::EnvVar {
+        name: "SOURCE_JOB_SENTINEL".into(),
+        value: Some("init".into()),
+        ..Default::default()
+    }];
+
+    let job = build_init_job(
+        "prod-init",
+        "tenant",
+        "odoo:18.0",
+        "odoo_db",
+        &["base".to_string()],
+        &inst,
+        &test_init_job("prod-init", false),
+    );
+    let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+
+    assert_eq!(container.name, "init");
+    assert_eq!(container.resources, Some(expected));
+    assert!(container
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|env| env.name == "SOURCE_JOB_SENTINEL"));
+    assert!(container
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|mount| mount.name == "odoo-source"));
+}
+
 // ── Volumes and mounts ──────────────────────────────────────────────────────
 
 #[test]

@@ -97,9 +97,49 @@ async fn reconcile_creates_child_resources() {
 
     let deps: Api<Deployment> = Api::namespaced(c.clone(), ns);
     assert!(deps.get("test-child").await.is_ok(), "deployment missing");
+    let deployment = deps
+        .get("test-child-cron")
+        .await
+        .expect("cron deployment is missing");
+    let container = &deployment.spec.unwrap().template.spec.unwrap().containers[0];
+
+    let startup = container.startup_probe.as_ref().unwrap();
+    assert_eq!(
+        startup.exec.as_ref().unwrap().command.as_ref().unwrap(),
+        &vec![
+            "/usr/bin/python3".to_string(),
+            "-I".to_string(),
+            "-S".to_string(),
+            "/usr/local/bin/dsh-cron-probe".to_string(),
+            "startup".to_string(),
+        ]
+    );
+    assert_eq!(startup.initial_delay_seconds, Some(5));
+    assert_eq!(startup.period_seconds, Some(10));
+    assert_eq!(startup.timeout_seconds, Some(5));
+    assert_eq!(startup.failure_threshold, Some(30));
+
+    let liveness = container.liveness_probe.as_ref().unwrap();
+    assert_eq!(
+        liveness.exec.as_ref().unwrap().command.as_ref().unwrap(),
+        &vec![
+            "/usr/bin/python3".to_string(),
+            "-I".to_string(),
+            "-S".to_string(),
+            "/usr/local/bin/dsh-cron-probe".to_string(),
+            "liveness".to_string(),
+        ]
+    );
+    assert_eq!(liveness.initial_delay_seconds, Some(300));
+    assert_eq!(liveness.period_seconds, Some(30));
+    assert_eq!(liveness.timeout_seconds, Some(5));
+    assert_eq!(liveness.failure_threshold, Some(3));
     assert!(
-        deps.get("test-child-cron").await.is_ok(),
-        "cron deployment is missing"
+        container
+            .env
+            .as_ref()
+            .is_none_or(|env| env.iter().all(|var| var.name != "PYTHONPATH")),
+        "cron probes must not depend on a pod-wide PYTHONPATH"
     );
 }
 

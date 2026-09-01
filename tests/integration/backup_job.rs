@@ -1,3 +1,4 @@
+use k8s_openapi::api::batch::v1::Job;
 use kube::api::{Api, PostParams};
 use serde_json::json;
 
@@ -12,6 +13,14 @@ async fn backup_job_lifecycle() {
     let (c, ns) = (&ctx.client, ctx.ns.as_str());
 
     let ready_handle = fast_track_to_running(&ctx, "test-backup-init").await;
+    let resources = source_job_resources();
+    patch_instance_spec(
+        c,
+        ns,
+        "test-backup",
+        source_runtime_patch(Some(&resources), "backup"),
+    )
+    .await;
 
     // Create OdooBackupJob → Running → BackingUp.
     let backup_api: Api<OdooBackupJob> = Api::namespaced(c.clone(), ns);
@@ -40,6 +49,8 @@ async fn backup_job_lifecycle() {
     );
 
     let k8s_job = wait_for_k8s_job_name::<OdooBackupJob>(c, ns, "test-backup-job").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    assert_job_containers_have_no_resources(&jobs.get(&k8s_job).await.unwrap());
     fake_job_succeeded(c, ns, &k8s_job).await;
 
     assert!(

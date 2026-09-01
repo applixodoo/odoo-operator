@@ -915,6 +915,7 @@ fn build_neutralize_job(
                 ]),
                 env: Some(envs),
                 volume_mounts: Some(odoo_volume_mounts_for(instance)),
+                resources: instance.spec.resources.clone(),
                 ..Default::default()
             },
             instance,

@@ -1,4 +1,5 @@
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::batch::v1::Job;
 use kube::api::{Api, PostParams};
 use serde_json::json;
 
@@ -18,6 +19,15 @@ async fn upgrade_job_lifecycle() -> anyhow::Result<()> {
     // race through Starting → Running after the upgrade completes.
     ready_handle.abort();
     fake_deployment_ready(c, ns, "test-upgrade", 0).await;
+
+    let resources = source_job_resources();
+    patch_instance_spec(
+        c,
+        ns,
+        "test-upgrade",
+        source_runtime_patch(Some(&resources), "upgrade"),
+    )
+    .await;
 
     // Get the main deployment's resource_version to later check if redeployed
     let deps: Api<Deployment> = Api::namespaced(c.clone(), ns);
@@ -62,6 +72,9 @@ async fn upgrade_job_lifecycle() -> anyhow::Result<()> {
     check_deployment_scale(c, ns, "test-upgrade", 1).await?;
 
     let k8s_job = wait_for_k8s_job_name::<OdooUpgradeJob>(c, ns, "test-upgrade-job").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    let rendered = jobs.get(&k8s_job).await?;
+    assert_source_job_container(&rendered, "odoo-upgrade", Some(&resources), "upgrade");
     fake_job_succeeded(c, ns, &k8s_job).await;
 
     assert!(

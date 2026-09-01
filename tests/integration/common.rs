@@ -15,7 +15,7 @@ use std::time::Duration;
 use envtest::Environment;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{Namespace, Secret};
+use k8s_openapi::api::core::v1::{Container, Namespace, ResourceRequirements, Secret};
 use kube::api::{Api, Patch, PatchParams, PostParams};
 use kube::config::KubeConfigOptions;
 use kube::runtime::events::Reporter;
@@ -303,6 +303,150 @@ pub fn test_instance_json(name: &str, ns: &str, replicas: i32) -> serde_json::Va
             },
         }
     })
+}
+
+pub fn source_job_resources() -> ResourceRequirements {
+    serde_json::from_value(json!({
+        "requests": {
+            "cpu": "731m",
+            "memory": "1537Mi",
+            "ephemeral-storage": "31Gi",
+        },
+        "limits": {
+            "cpu": "1103m",
+            "memory": "2053Mi",
+            "ephemeral-storage": "32Gi",
+        },
+    }))
+    .unwrap()
+}
+
+pub fn source_runtime_patch(
+    resources: Option<&ResourceRequirements>,
+    sentinel: &str,
+) -> serde_json::Value {
+    let mut patch = json!({
+        "sourceVolume": {
+            "claimName": "source-artifacts",
+            "mounts": [
+                { "mountPath": "/work" },
+                { "mountPath": "/build", "subPath": "build" },
+            ],
+            "odooBin": "/work/instances/prod/odoo/odoo-bin",
+        },
+        "extraEnv": [{ "name": "SOURCE_JOB_SENTINEL", "value": sentinel }],
+    });
+    if let Some(resources) = resources {
+        patch["resources"] = serde_json::to_value(resources).unwrap();
+    }
+    patch
+}
+
+pub fn job_container<'a>(job: &'a Job, name: &str) -> &'a Container {
+    job.spec
+        .as_ref()
+        .unwrap()
+        .template
+        .spec
+        .as_ref()
+        .unwrap()
+        .containers
+        .iter()
+        .find(|container| container.name == name)
+        .unwrap_or_else(|| panic!("rendered Job has no {name} container"))
+}
+
+pub fn assert_source_job_container(
+    job: &Job,
+    name: &str,
+    resources: Option<&ResourceRequirements>,
+    sentinel: &str,
+) {
+    let container = job_container(job, name);
+    assert_eq!(
+        container.resources.clone().unwrap_or_default(),
+        resources.cloned().unwrap_or_default()
+    );
+    assert!(
+        container
+            .env
+            .as_ref()
+            .is_some_and(|env| env.iter().any(|var| {
+                var.name == "SOURCE_JOB_SENTINEL" && var.value.as_deref() == Some(sentinel)
+            })),
+        "{name} must carry the instance's extraEnv"
+    );
+    assert!(
+        container
+            .volume_mounts
+            .as_ref()
+            .is_some_and(|mounts| mounts.iter().any(|mount| mount.name == "odoo-source")),
+        "{name} must mount the source volume"
+    );
+}
+
+pub fn assert_job_containers_have_no_resources(job: &Job) {
+    let pod = job.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    for container in pod
+        .init_containers
+        .iter()
+        .flatten()
+        .chain(pod.containers.iter())
+    {
+        assert_eq!(
+            container.resources.clone().unwrap_or_default(),
+            ResourceRequirements::default(),
+            "{} must remain an unresourced tooling container",
+            container.name
+        );
+    }
+}
+
+pub fn assert_init_containers_have_no_resources(job: &Job) {
+    for container in job
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .spec
+        .as_ref()
+        .unwrap()
+        .init_containers
+        .iter()
+        .flatten()
+    {
+        assert_eq!(
+            container.resources.clone().unwrap_or_default(),
+            ResourceRequirements::default(),
+            "{} must remain an unresourced tooling init container",
+            container.name
+        );
+    }
+}
+
+#[test]
+fn legacy_none_resource_assertion_accepts_apiserver_empty_object() {
+    let job: Job = serde_json::from_value(json!({
+        "metadata": {},
+        "spec": {
+            "template": {
+                "spec": {
+                    "initContainers": [{ "name": "tooling", "resources": {} }],
+                    "containers": [{
+                        "name": "neutralize",
+                        "resources": {},
+                        "env": [{ "name": "SOURCE_JOB_SENTINEL", "value": "none" }],
+                        "volumeMounts": [{ "name": "odoo-source", "mountPath": "/work" }],
+                    }]
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    assert_source_job_container(&job, "neutralize", None, "none");
+    assert_job_containers_have_no_resources(&job);
+    assert_init_containers_have_no_resources(&job);
 }
 
 fn test_defaults() -> OperatorDefaults {

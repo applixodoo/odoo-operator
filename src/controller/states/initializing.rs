@@ -120,6 +120,7 @@ pub fn build_init_job(
                     command: Some(command),
                     args: Some(args),
                     volume_mounts: Some(odoo_volume_mounts_for(instance)),
+                    resources: instance.spec.resources.clone(),
                     ..Default::default()
                 },
                 instance,

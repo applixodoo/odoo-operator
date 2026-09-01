@@ -1,3 +1,4 @@
+use k8s_openapi::api::batch::v1::Job;
 use kube::api::{Api, PostParams};
 use serde_json::json;
 
@@ -15,6 +16,15 @@ async fn init_job_lifecycle() -> anyhow::Result<()> {
         wait_for_phase(c, ns, "test-init", OdooInstancePhase::Uninitialized).await,
         "expected Uninitialized"
     );
+
+    let resources = source_job_resources();
+    patch_instance_spec(
+        c,
+        ns,
+        "test-init",
+        source_runtime_patch(Some(&resources), "init"),
+    )
+    .await;
 
     let init_api: Api<OdooInitJob> = Api::namespaced(c.clone(), ns);
     let init_job: OdooInitJob = serde_json::from_value(json!({
@@ -42,6 +52,9 @@ async fn init_job_lifecycle() -> anyhow::Result<()> {
     check_deployment_scale(c, ns, "test-init-cron", 0).await?;
 
     let k8s_job = wait_for_k8s_job_name::<OdooInitJob>(c, ns, "test-init-job").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    let rendered = jobs.get(&k8s_job).await?;
+    assert_source_job_container(&rendered, "init", Some(&resources), "init");
     fake_job_succeeded(c, ns, &k8s_job).await;
 
     assert!(
@@ -73,6 +86,14 @@ async fn init_job_failure_and_retry() -> anyhow::Result<()> {
         "expected Uninitialized"
     );
 
+    patch_instance_spec(
+        c,
+        ns,
+        "test-initfail",
+        source_runtime_patch(None, "init-none"),
+    )
+    .await;
+
     let init_api: Api<OdooInitJob> = Api::namespaced(c.clone(), ns);
     let init_job: OdooInitJob = serde_json::from_value(json!({
         "apiVersion": "bemade.org/v1alpha1",
@@ -92,6 +113,9 @@ async fn init_job_failure_and_retry() -> anyhow::Result<()> {
     );
 
     let k8s_job = wait_for_k8s_job_name::<OdooInitJob>(c, ns, "test-initfail-job1").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    let rendered = jobs.get(&k8s_job).await?;
+    assert_source_job_container(&rendered, "init", None, "init-none");
     fake_job_failed(c, ns, &k8s_job).await;
 
     assert!(

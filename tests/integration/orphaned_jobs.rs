@@ -69,6 +69,13 @@ async fn upgrade_job_orphaned_recovers_to_starting() {
     // Stop faking readyReplicas so we land in Starting (not Running).
     ready_handle.abort();
     fake_deployment_ready(c, ns, "test-up-orphan", 0).await;
+    patch_instance_spec(
+        c,
+        ns,
+        "test-up-orphan",
+        source_runtime_patch(None, "upgrade-none"),
+    )
+    .await;
 
     // Create OdooUpgradeJob → Upgrading.
     let upgrade_api: Api<OdooUpgradeJob> = Api::namespaced(c.clone(), ns);
@@ -91,6 +98,10 @@ async fn upgrade_job_orphaned_recovers_to_starting() {
         wait_for_phase(c, ns, "test-up-orphan", OdooInstancePhase::Upgrading).await,
         "expected Upgrading after upgrade job created"
     );
+    let k8s_job = wait_for_k8s_job_name::<OdooUpgradeJob>(c, ns, "test-up-orphan-job").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    let rendered = jobs.get(&k8s_job).await.unwrap();
+    assert_source_job_container(&rendered, "odoo-upgrade", None, "upgrade-none");
 
     // Delete the OdooUpgradeJob CR.
     upgrade_api
@@ -115,6 +126,14 @@ async fn restore_job_orphaned_recovers_to_starting() {
         wait_for_phase(c, ns, "test-rs-orphan", OdooInstancePhase::Uninitialized).await,
         "expected Uninitialized"
     );
+    let resources = source_job_resources();
+    patch_instance_spec(
+        c,
+        ns,
+        "test-rs-orphan",
+        source_runtime_patch(Some(&resources), "restore-noop"),
+    )
+    .await;
 
     // Create OdooRestoreJob → Restoring.
     let restore_api: Api<OdooRestoreJob> = Api::namespaced(c.clone(), ns);
@@ -124,6 +143,7 @@ async fn restore_job_orphaned_recovers_to_starting() {
         "metadata": { "name": "test-rs-orphan-job", "namespace": ns },
         "spec": {
             "odooInstanceRef": { "name": "test-rs-orphan" },
+            "neutralize": false,
             "source": {
                 "type": "s3",
                 "s3": {
@@ -144,6 +164,11 @@ async fn restore_job_orphaned_recovers_to_starting() {
         wait_for_phase(c, ns, "test-rs-orphan", OdooInstancePhase::Restoring).await,
         "expected Restoring after restore job created"
     );
+    let k8s_job = wait_for_k8s_job_name::<OdooRestoreJob>(c, ns, "test-rs-orphan-job").await;
+    let jobs: Api<Job> = Api::namespaced(c.clone(), ns);
+    let rendered = jobs.get(&k8s_job).await.unwrap();
+    assert_job_containers_have_no_resources(&rendered);
+    assert_eq!(job_container(&rendered, "noop").name, "noop");
 
     // Delete the OdooRestoreJob CR.
     restore_api
