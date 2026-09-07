@@ -16,8 +16,8 @@ use odoo_operator::controller::odoo_instance::{cnpg_app_secret_name, cnpg_config
 use odoo_operator::controller::states::build_init_job;
 use odoo_operator::crd::odoo_init_job::{OdooInitJob, OdooInitJobSpec};
 use odoo_operator::crd::odoo_instance::{
-    AdminPasswordSecretRef, CronSpec, IngressSpec, OdooInstance, OdooInstanceSpec,
-    SourceVolumeMount, SourceVolumeSpec,
+    AdminPasswordSecretRef, CronSpec, CustomSourceVolumeSpec, IngressSpec, OdooInstance,
+    OdooInstanceSpec, SourceVolumeMount, SourceVolumeSpec,
 };
 use odoo_operator::crd::shared::OdooInstanceRef;
 
@@ -63,6 +63,7 @@ fn base_instance(name: &str) -> OdooInstance {
             extra_env: vec![],
             extra_env_from: vec![],
             source_volume: None,
+            custom_source_volume: None,
             run_as_user: None,
             run_as_group: None,
         },
@@ -538,6 +539,53 @@ fn source_volume_mount_honours_read_only() {
     let mut inst = with_source_volume(base_instance("prod"));
     inst.spec.source_volume.as_mut().unwrap().mounts[0].read_only = true;
     assert_eq!(source_volume_mounts(&inst)[0].read_only, Some(true));
+}
+
+#[test]
+fn custom_source_is_read_only_in_the_shared_consumer_path_and_init_job() {
+    let mut inst = with_source_volume(base_instance("prod"));
+    inst.spec.custom_source_volume = Some(CustomSourceVolumeSpec {
+        claim_name: "prod-custom-source".into(),
+        mounts: vec![SourceVolumeMount {
+            mount_path: "/custom".into(),
+            sub_path: None,
+            // Even a caller bypassing admission cannot make Odoo a source writer.
+            read_only: false,
+        }],
+    });
+    let job = build_init_job(
+        "prod-init",
+        "tenant",
+        "odoo:18.0",
+        "odoo_db",
+        &["base".into()],
+        &inst,
+        &test_init_job("prod-init", false),
+    );
+    let pod = job.spec.unwrap().template.spec.unwrap();
+    let volumes = pod.volumes.unwrap();
+    let custom = volumes
+        .iter()
+        .find(|v| v.name == "odoo-custom-source")
+        .unwrap();
+    let claim = custom.persistent_volume_claim.as_ref().unwrap();
+    assert_eq!(claim.claim_name, "prod-custom-source");
+    assert_eq!(claim.read_only, Some(true));
+    let expected = source_volume_mounts(&inst)
+        .into_iter()
+        .find(|m| m.name == "odoo-custom-source")
+        .unwrap();
+    assert_eq!(expected.mount_path, "/custom");
+    assert_eq!(expected.read_only, Some(true));
+    assert!(pod.containers[0]
+        .volume_mounts
+        .as_ref()
+        .unwrap()
+        .contains(&expected));
+    assert_eq!(
+        odoo_entrypoint(&inst),
+        odoo_entrypoint(&with_source_volume(base_instance("prod")))
+    );
 }
 
 // ── Security context ────────────────────────────────────────────────────────

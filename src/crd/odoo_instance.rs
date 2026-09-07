@@ -95,6 +95,14 @@ pub struct SourceVolumeSpec {
     pub odoo_bin: String,
 }
 
+/// Shared custom addons, read-only to Odoo and managed by the hosting platform.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomSourceVolumeSpec {
+    pub claim_name: String,
+    pub mounts: Vec<SourceVolumeMount>,
+}
+
 /// AdminPasswordSecretRef sources the Odoo master password from a Secret
 /// instead of carrying it in plaintext in the CR.
 ///
@@ -440,6 +448,16 @@ fn default_init_modules() -> Vec<String> {
         .message(Message::Expression(
             "'spec.sourceVolume.mounts must not be empty'".into()
         )),
+    rule = Rule::new("!has(self.customSourceVolume) || size(self.customSourceVolume.mounts) > 0")
+        .message(Message::Expression(
+            "'spec.customSourceVolume.mounts must not be empty'".into()
+        )),
+    rule = Rule::new(
+        "!has(self.customSourceVolume) || self.customSourceVolume.mounts.all(m, m.mountPath.startsWith('/') && m.readOnly)"
+    )
+        .message(Message::Expression(
+            "'spec.customSourceVolume mounts must be absolute and read-only'".into()
+        )),
     rule = Rule::new("!has(self.sourceVolume) || self.sourceVolume.odooBin.startsWith('/')")
         .message(Message::Expression(
             "'spec.sourceVolume.odooBin must be an absolute path'".into()
@@ -585,6 +603,11 @@ pub struct OdooInstanceSpec {
     /// image's `/entrypoint.sh` convention. Absent = upstream behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_volume: Option<SourceVolumeSpec>,
+
+    /// Additional custom source shared with an external editor. The platform
+    /// creates and populates the claim; Odoo always mounts it read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_source_volume: Option<CustomSourceVolumeSpec>,
 
     /// `runAsUser` for every Odoo pod and job pod. Defaults to 100, the uid in
     /// the official Odoo image. Set this when the image runs Odoo as a

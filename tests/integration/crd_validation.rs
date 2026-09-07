@@ -113,6 +113,39 @@ async fn valid_source_volume_is_accepted() {
 }
 
 #[tokio::test]
+async fn custom_source_requires_nonempty_absolute_read_only_mounts() {
+    let ctx = TestContext::new_ns().await;
+    for (name, mounts, accepted) in [
+        (
+            "custom-ok",
+            json!([{ "mountPath": "/custom", "readOnly": true }]),
+            true,
+        ),
+        ("custom-empty", json!([]), false),
+        (
+            "custom-relative",
+            json!([{ "mountPath": "custom", "readOnly": true }]),
+            false,
+        ),
+        (
+            "custom-writable",
+            json!([{ "mountPath": "/custom", "readOnly": false }]),
+            false,
+        ),
+    ] {
+        let body = instance_with_spec(name, &ctx.ns, |spec| {
+            spec["customSourceVolume"] =
+                json!({ "claimName": "prod-custom-source", "mounts": mounts });
+        });
+        let result = try_create(&ctx.client, &ctx.ns, body).await;
+        assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+        if let Err(error) = result {
+            assert!(error.contains("spec.customSourceVolume"), "{error}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn source_volume_with_no_mounts_is_rejected() {
     let ctx = TestContext::new_ns().await;
     let body = instance_with_spec("sv-empty", &ctx.ns, |spec| {

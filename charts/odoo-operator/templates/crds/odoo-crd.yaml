@@ -615,6 +615,38 @@ spec:
                         type: object
                     type: object
                 type: object
+              customSourceVolume:
+                description: Additional custom source shared with an external editor. The platform creates and populates the claim; Odoo always mounts it read-only.
+                nullable: true
+                properties:
+                  claimName:
+                    type: string
+                  mounts:
+                    items:
+                      description: |-
+                        One mount of the [`SourceVolumeSpec`] claim into an Odoo container.
+
+                        The same claim is usually mounted more than once — the platform that owns the claim lays out both the Odoo checkouts and a `pip install --target` dependency tree on it, and the runtime has to reproduce the *absolute* paths the build step used (e.g. whole volume at `/work`, `subPath: build` at `/build`).
+                      properties:
+                        mountPath:
+                          description: Absolute path inside the container.
+                          type: string
+                        readOnly:
+                          default: false
+                          description: Mount read-only. Defaults to `false`.
+                          type: boolean
+                        subPath:
+                          description: Optional path *within* the volume to mount at `mountPath`.
+                          nullable: true
+                          type: string
+                      required:
+                      - mountPath
+                      type: object
+                    type: array
+                required:
+                - claimName
+                - mounts
+                type: object
               database:
                 description: DatabaseSpec identifies which PostgreSQL cluster to use for this instance.
                 nullable: true
@@ -1060,6 +1092,10 @@ spec:
               rule: has(self.adminPassword) != has(self.adminPasswordSecretRef)
             - messageExpression: '''spec.sourceVolume.mounts must not be empty'''
               rule: '!has(self.sourceVolume) || size(self.sourceVolume.mounts) > 0'
+            - messageExpression: '''spec.customSourceVolume.mounts must not be empty'''
+              rule: '!has(self.customSourceVolume) || size(self.customSourceVolume.mounts) > 0'
+            - messageExpression: '''spec.customSourceVolume mounts must be absolute and read-only'''
+              rule: '!has(self.customSourceVolume) || self.customSourceVolume.mounts.all(m, m.mountPath.startsWith(''/'') && m.readOnly)'
             - messageExpression: '''spec.sourceVolume.odooBin must be an absolute path'''
               rule: '!has(self.sourceVolume) || self.sourceVolume.odooBin.startsWith(''/'')'
             - messageExpression: '''spec.sourceVolume.mounts[].mountPath must be an absolute path'''
