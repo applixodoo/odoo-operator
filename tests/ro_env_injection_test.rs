@@ -48,6 +48,7 @@ fn make_instance(name: &str, ro: Option<ReadOnlySqlAccessSpec>) -> OdooInstance 
             extra_env: vec![],
             extra_env_from: vec![],
             source_volume: None,
+            custom_source_volume: None,
             run_as_user: None,
             run_as_group: None,
         },

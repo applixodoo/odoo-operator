@@ -165,6 +165,7 @@ fn make_instance(uid: Option<&str>, db_name: Option<&str>) -> OdooInstance {
             extra_env: vec![],
             extra_env_from: vec![],
             source_volume: None,
+            custom_source_volume: None,
             run_as_user: None,
             run_as_group: None,
         },

@@ -193,45 +193,65 @@ pub fn odoo_volume_mounts() -> Vec<VolumeMount> {
 
 // ── Source volume + the command that launches Odoo ───────────────────────────
 
-/// The pod volume for `spec.sourceVolume`, or empty when unset.
-///
-/// Returned as a `Vec` so callers can `extend` unconditionally and produce a
-/// byte-identical pod spec when the field is absent.
+/// Core/dependency and custom-source claims for every Odoo consumer.
 pub fn source_volumes(instance: &OdooInstance) -> Vec<Volume> {
-    let Some(sv) = instance.spec.source_volume.as_ref() else {
-        return vec![];
-    };
-    vec![Volume {
-        name: SOURCE_VOLUME_NAME.to_string(),
-        persistent_volume_claim: Some(
-            k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                claim_name: sv.claim_name.clone(),
-                ..Default::default()
-            },
+    [
+        (
+            SOURCE_VOLUME_NAME,
+            instance.spec.source_volume.as_ref().map(|v| &v.claim_name),
         ),
-        ..Default::default()
-    }]
-}
-
-/// The mounts for `spec.sourceVolume`, or empty when unset.
-///
-/// One `VolumeMount` per declared mount — the same claim is mounted several
-/// times so the runtime reproduces the absolute paths the source tree was
-/// built against.
-pub fn source_volume_mounts(instance: &OdooInstance) -> Vec<VolumeMount> {
-    let Some(sv) = instance.spec.source_volume.as_ref() else {
-        return vec![];
-    };
-    sv.mounts
-        .iter()
-        .map(|m| VolumeMount {
-            name: SOURCE_VOLUME_NAME.to_string(),
-            mount_path: m.mount_path.clone(),
-            sub_path: m.sub_path.clone(),
-            read_only: if m.read_only { Some(true) } else { None },
+        (
+            "odoo-custom-source",
+            instance
+                .spec
+                .custom_source_volume
+                .as_ref()
+                .map(|v| &v.claim_name),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, claim)| {
+        claim.map(|claim| Volume {
+            name: name.to_string(),
+            persistent_volume_claim: Some(
+                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                    claim_name: claim.clone(),
+                    read_only: (name == "odoo-custom-source").then_some(true),
+                },
+            ),
             ..Default::default()
         })
-        .collect()
+    })
+    .collect()
+}
+
+/// Mount both source claims through the shared serving/job construction path.
+pub fn source_volume_mounts(instance: &OdooInstance) -> Vec<VolumeMount> {
+    [
+        (
+            SOURCE_VOLUME_NAME,
+            instance.spec.source_volume.as_ref().map(|v| &v.mounts),
+        ),
+        (
+            "odoo-custom-source",
+            instance
+                .spec
+                .custom_source_volume
+                .as_ref()
+                .map(|v| &v.mounts),
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(name, mounts)| {
+        mounts.into_iter().flatten().map(move |m| VolumeMount {
+            name: name.to_string(),
+            mount_path: m.mount_path.clone(),
+            sub_path: m.sub_path.clone(),
+            read_only: (m.read_only || name == "odoo-custom-source").then_some(true),
+            ..Default::default()
+        })
+    })
+    .collect()
 }
 
 /// [`odoo_volume_mounts`] plus the source-volume mounts. Use this for every
