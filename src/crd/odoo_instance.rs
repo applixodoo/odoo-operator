@@ -103,6 +103,23 @@ pub struct CustomSourceVolumeSpec {
     pub mounts: Vec<SourceVolumeMount>,
 }
 
+/// Production HTTP telemetry only. The platform owns the immutable mapping
+/// ConfigMap; the operator owns the exporter container and its fixed contract.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitoringSpec {
+    #[schemars(
+        length(max = 256),
+        regex(
+            pattern = "^(docker.io/)?prom/statsd-exporter:v[0-9]+[.][0-9]+[.][0-9]+@sha256:[a-f0-9]{64}$"
+        )
+    )]
+    pub exporter_image: String,
+    /// Content-addressed, immutable ConfigMap with `statsd-mapping.yml`.
+    #[schemars(length(max = 63), regex(pattern = "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
+    pub config_map_name: String,
+}
+
 /// AdminPasswordSecretRef sources the Odoo master password from a Secret
 /// instead of carrying it in plaintext in the CR.
 ///
@@ -472,6 +489,10 @@ fn default_init_modules() -> Vec<String> {
     // that the shell word-splits on expansion. Quoting it there is impossible
     // (expansion does not re-process quotes), so a path containing whitespace
     // would silently split into two arguments. Reject it at admission instead.
+    rule = Rule::new("!has(self.monitoring) || self.environment == 'Production'")
+        .message(Message::Expression(
+            "'spec.monitoring is supported only for Production'".into()
+        )),
     rule = Rule::new("!has(self.sourceVolume) || !self.sourceVolume.odooBin.contains(' ')")
         .message(Message::Expression(
             "'spec.sourceVolume.odooBin must not contain whitespace'".into()
@@ -608,6 +629,11 @@ pub struct OdooInstanceSpec {
     /// creates and populates the claim; Odoo always mounts it read-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_source_volume: Option<CustomSourceVolumeSpec>,
+
+    /// Opt-in local StatsD exporter for the production web deployment only.
+    /// Cron and job pods never receive instrumentation or exporter containers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitoring: Option<MonitoringSpec>,
 
     /// `runAsUser` for every Odoo pod and job pod. Defaults to 100, the uid in
     /// the official Odoo image. Set this when the image runs Odoo as a

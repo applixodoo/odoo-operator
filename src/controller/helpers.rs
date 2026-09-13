@@ -39,6 +39,21 @@ pub fn instance_labels(instance: &OdooInstance) -> std::collections::BTreeMap<St
         instance.spec.environment.as_label().to_string(),
     );
     m.insert("bemade.org/instance".to_string(), instance.name_any());
+    // Hosting identity is an immutable platform ID, never the mutable instance slug.
+    for key in [
+        "droggol.sh/server-id",
+        "droggol.sh/project-id",
+        "droggol.sh/instance-id",
+    ] {
+        if let Some(value) = instance
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(key))
+        {
+            m.insert(key.to_string(), value.clone());
+        }
+    }
     m
 }
 

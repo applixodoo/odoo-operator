@@ -897,6 +897,23 @@ spec:
                     - url
                     type: object
                 type: object
+              monitoring:
+                description: Opt-in local StatsD exporter for the production web deployment only. Cron and job pods never receive instrumentation or exporter containers.
+                nullable: true
+                properties:
+                  configMapName:
+                    description: Content-addressed, immutable ConfigMap with `statsd-mapping.yml`.
+                    maxLength: 63
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                    type: string
+                  exporterImage:
+                    maxLength: 256
+                    pattern: ^(docker.io/)?prom/statsd-exporter:v[0-9]+[.][0-9]+[.][0-9]+@sha256:[a-f0-9]{64}$
+                    type: string
+                required:
+                - configMapName
+                - exporterImage
+                type: object
               probes:
                 description: ProbesSpec configures the HTTP health check paths for Kubernetes probes.
                 nullable: true
@@ -1100,6 +1117,8 @@ spec:
               rule: '!has(self.sourceVolume) || self.sourceVolume.odooBin.startsWith(''/'')'
             - messageExpression: '''spec.sourceVolume.mounts[].mountPath must be an absolute path'''
               rule: '!has(self.sourceVolume) || self.sourceVolume.mounts.all(m, m.mountPath.startsWith(''/''))'
+            - messageExpression: '''spec.monitoring is supported only for Production'''
+              rule: '!has(self.monitoring) || self.environment == ''Production'''
             - messageExpression: '''spec.sourceVolume.odooBin must not contain whitespace'''
               rule: '!has(self.sourceVolume) || !self.sourceVolume.odooBin.contains('' '')'
           status:

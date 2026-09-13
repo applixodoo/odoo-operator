@@ -8,6 +8,98 @@ use serde_json::json;
 use super::common::*;
 use odoo_operator::crd::odoo_instance::{OdooInstance, OdooInstancePhase};
 
+#[tokio::test]
+async fn monitoring_reconciles_web_only_and_can_be_removed() {
+    let name = "test-monitoring";
+    let ctx = TestContext::new(name).await;
+    assert!(wait_for_phase(&ctx.client, &ctx.ns, name, OdooInstancePhase::Uninitialized).await);
+    let api: Api<OdooInstance> = Api::namespaced(ctx.client.clone(), &ctx.ns);
+    api.patch(name, &PatchParams::default(), &Patch::Merge(json!({
+        "metadata": {"labels": {"droggol.sh/instance-id": "instance-ulid", "droggol.sh/project-id": "project-ulid"}},
+        "spec": {"environment": "Production", "monitoring": {
+            "exporterImage": format!("prom/statsd-exporter:v0.29.0@sha256:{}", "a".repeat(64)),
+            "configMapName": "test-monitoring-config-abcd"
+        }}
+    }))).await.unwrap();
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ctx.ns);
+    assert!(
+        wait_for(TIMEOUT, POLL, || {
+            let deployments = deployments.clone();
+            async move {
+                deployments
+                    .get(name)
+                    .await
+                    .ok()
+                    .and_then(|dep| dep.spec)
+                    .and_then(|spec| spec.template.spec)
+                    .is_some_and(|pod| pod.containers.len() == 2)
+            }
+        })
+        .await
+    );
+    let web = deployments.get(name).await.unwrap().spec.unwrap();
+    assert_eq!(web.selector.match_labels.unwrap().len(), 1);
+    assert_eq!(
+        web.template.metadata.unwrap().labels.unwrap()["droggol.sh/instance-id"],
+        "instance-ulid"
+    );
+    let cron = deployments
+        .get(&format!("{name}-cron"))
+        .await
+        .unwrap()
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap();
+    assert_eq!(cron.containers.len(), 1);
+    assert!(!cron.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .any(|env| env.name.starts_with("DSH_MONITORING_")));
+    assert!(!cron
+        .volumes
+        .unwrap()
+        .iter()
+        .any(|volume| volume.name.starts_with("droggol-monitoring")));
+    let services: Api<Service> = Api::namespaced(ctx.client.clone(), &ctx.ns);
+    assert!(!services
+        .get(name)
+        .await
+        .unwrap()
+        .spec
+        .unwrap()
+        .ports
+        .unwrap()
+        .iter()
+        .any(|port| port.port == 9102));
+    patch_instance_spec(&ctx.client, &ctx.ns, name, json!({"monitoring": null})).await;
+    assert!(
+        wait_for(TIMEOUT, POLL, || {
+            let deployments = deployments.clone();
+            async move {
+                deployments
+                    .get(name)
+                    .await
+                    .ok()
+                    .and_then(|dep| dep.spec)
+                    .and_then(|spec| spec.template.spec)
+                    .is_some_and(|pod| {
+                        pod.containers.len() == 1
+                            && !pod
+                                .volumes
+                                .unwrap()
+                                .iter()
+                                .any(|volume| volume.name.starts_with("droggol-monitoring"))
+                    })
+            }
+        })
+        .await
+    );
+}
+
 /// When imagePullSecret is set, the operator should copy the registry secret
 /// from the operator namespace into the instance namespace.
 #[tokio::test]
