@@ -105,7 +105,7 @@ pub struct CustomSourceVolumeSpec {
 
 /// Production HTTP telemetry only. The platform owns the immutable mapping
 /// ConfigMap; the operator owns the exporter container and its fixed contract.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitoringSpec {
     #[schemars(
@@ -118,6 +118,10 @@ pub struct MonitoringSpec {
     /// Content-addressed, immutable ConfigMap with `statsd-mapping.yml`.
     #[schemars(length(max = 63), regex(pattern = "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"))]
     pub config_map_name: String,
+    /// Optional exporter resource budget. Omitting this field retains the operator's
+    /// default requests (10m CPU, 32Mi memory) and limits (100m CPU, 128Mi memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceRequirements>,
 }
 
 /// AdminPasswordSecretRef sources the Odoo master password from a Secret

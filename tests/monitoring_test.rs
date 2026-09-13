@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{Container, PodSpec};
+use k8s_openapi::api::core::v1::{Container, PodSpec, ResourceRequirements};
 use kube::CustomResourceExt;
 use odoo_operator::controller::{helpers::instance_labels, monitoring::apply_web_monitoring};
 use odoo_operator::crd::odoo_instance::OdooInstance;
@@ -75,10 +75,42 @@ fn production_uses_fixed_local_bounded_supervised_exporter_contract() {
         .unwrap();
     assert_eq!(limits["memory"].0, "128Mi");
     assert_eq!(limits["cpu"].0, "100m");
+    let requests = exporter
+        .resources
+        .as_ref()
+        .unwrap()
+        .requests
+        .as_ref()
+        .unwrap();
+    assert_eq!(requests["memory"].0, "32Mi");
+    assert_eq!(requests["cpu"].0, "10m");
     let state = pod.volumes.as_ref().unwrap()[0].empty_dir.as_ref().unwrap();
     assert_eq!(state.medium.as_deref(), Some("Memory"));
     assert_eq!(state.size_limit.as_ref().unwrap().0, "16Mi");
     assert!(pod.init_containers.is_none());
+}
+
+#[test]
+fn custom_monitoring_budget_changes_only_exporter_resources_and_can_be_removed() {
+    let mut instance = instance("Production", true);
+    let mut default_pod = web_pod();
+    apply_web_monitoring(&mut default_pod, &instance);
+    let resources: ResourceRequirements = serde_json::from_value(json!({
+        "requests": {"cpu": "400m", "memory": "512Mi"},
+        "limits": {"cpu": "400m", "memory": "512Mi"},
+    }))
+    .unwrap();
+    instance.spec.monitoring.as_mut().unwrap().resources = Some(resources.clone());
+    let mut custom_pod = web_pod();
+    apply_web_monitoring(&mut custom_pod, &instance);
+    let mut expected = default_pod.clone();
+    expected.containers[1].resources = Some(resources);
+    assert_eq!(custom_pod, expected);
+
+    instance.spec.monitoring.as_mut().unwrap().resources = None;
+    let mut reverted_pod = web_pod();
+    apply_web_monitoring(&mut reverted_pod, &instance);
+    assert_eq!(reverted_pod, default_pod);
 }
 
 #[test]
@@ -110,6 +142,19 @@ fn monitoring_schema_requires_pinned_official_image_and_production() {
         .contains("@sha256:"));
     assert_eq!(monitoring["exporterImage"]["maxLength"], 256);
     assert_eq!(monitoring["configMapName"]["maxLength"], 63);
+    assert_eq!(
+        monitoring["resources"]["properties"]["requests"]["type"],
+        "object"
+    );
+    assert_eq!(
+        monitoring["resources"]["properties"]["limits"]["type"],
+        "object"
+    );
+    assert!(!spec["properties"]["monitoring"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "resources"));
     assert!(spec["x-kubernetes-validations"]
         .as_array()
         .unwrap()

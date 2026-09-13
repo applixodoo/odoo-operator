@@ -75,6 +75,51 @@ async fn monitoring_reconciles_web_only_and_can_be_removed() {
         .unwrap()
         .iter()
         .any(|port| port.port == 9102));
+    let resources = json!({
+        "requests": {"cpu": "400m", "memory": "512Mi"},
+        "limits": {"cpu": "400m", "memory": "512Mi"},
+    });
+    patch_instance_spec(
+        &ctx.client,
+        &ctx.ns,
+        name,
+        json!({"monitoring": {"resources": resources}}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_value(
+            api.get(name)
+                .await
+                .unwrap()
+                .spec
+                .monitoring
+                .unwrap()
+                .resources
+        )
+        .unwrap(),
+        resources,
+    );
+    assert!(
+        wait_for(TIMEOUT, POLL, || {
+            let deployments = deployments.clone();
+            let resources = resources.clone();
+            async move {
+                deployments
+                    .get(name)
+                    .await
+                    .ok()
+                    .and_then(|dep| dep.spec)
+                    .and_then(|spec| spec.template.spec)
+                    .is_some_and(|pod| {
+                        pod.containers.iter().any(|container| {
+                            container.name == "odoo-statsd-exporter"
+                                && serde_json::to_value(&container.resources).unwrap() == resources
+                        })
+                    })
+            }
+        })
+        .await
+    );
     patch_instance_spec(&ctx.client, &ctx.ns, name, json!({"monitoring": null})).await;
     assert!(
         wait_for(TIMEOUT, POLL, || {

@@ -114,17 +114,22 @@ pub fn apply_web_monitoring(pod: &mut PodSpec, instance: &OdooInstance) {
                 ..Default::default()
             },
         ]),
-        resources: Some(ResourceRequirements {
-            requests: Some(BTreeMap::from([
-                ("cpu".to_string(), Quantity("10m".to_string())),
-                ("memory".to_string(), Quantity("32Mi".to_string())),
-            ])),
-            limits: Some(BTreeMap::from([
-                ("cpu".to_string(), Quantity("100m".to_string())),
-                ("memory".to_string(), Quantity("128Mi".to_string())),
-            ])),
-            ..Default::default()
-        }),
+        resources: Some(
+            config
+                .resources
+                .clone()
+                .unwrap_or_else(|| ResourceRequirements {
+                    requests: Some(BTreeMap::from([
+                        ("cpu".to_string(), Quantity("10m".to_string())),
+                        ("memory".to_string(), Quantity("32Mi".to_string())),
+                    ])),
+                    limits: Some(BTreeMap::from([
+                        ("cpu".to_string(), Quantity("100m".to_string())),
+                        ("memory".to_string(), Quantity("128Mi".to_string())),
+                    ])),
+                    ..Default::default()
+                }),
+        ),
         security_context: Some(SecurityContext {
             allow_privilege_escalation: Some(false),
             read_only_root_filesystem: Some(true),
