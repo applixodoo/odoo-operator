@@ -44,6 +44,39 @@ async fn try_create(
 }
 
 #[tokio::test]
+async fn monitoring_requires_production_and_a_pinned_official_exporter() {
+    let ctx = TestContext::new_ns().await;
+    for (name, environment, image, accepted) in [
+        (
+            "monitor-good",
+            "Production",
+            format!("prom/statsd-exporter:v0.29.0@sha256:{}", "a".repeat(64)),
+            true,
+        ),
+        (
+            "monitor-staging",
+            "Staging",
+            format!("prom/statsd-exporter:v0.29.0@sha256:{}", "a".repeat(64)),
+            false,
+        ),
+        (
+            "monitor-unpinned",
+            "Production",
+            "prom/statsd-exporter:latest".to_string(),
+            false,
+        ),
+    ] {
+        let body = instance_with_spec(name, &ctx.ns, |spec| {
+            spec["environment"] = json!(environment);
+            spec["monitoring"] =
+                json!({"exporterImage": image, "configMapName": "monitor-config-abcd"});
+        });
+        let result = try_create(&ctx.client, &ctx.ns, body).await;
+        assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+    }
+}
+
+#[tokio::test]
 async fn admin_password_plaintext_alone_is_accepted() {
     let ctx = TestContext::new_ns().await;
     let body = instance_with_spec("pw-plain", &ctx.ns, |_| {});

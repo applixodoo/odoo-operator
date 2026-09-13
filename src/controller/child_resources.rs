@@ -933,7 +933,7 @@ pub async fn ensure_deployment(
 
     let mut depl_labels = BTreeMap::from([("app".to_string(), name.to_string())]);
     depl_labels.extend(super::helpers::instance_labels(instance));
-    let dep = Deployment {
+    let mut dep = Deployment {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
@@ -1029,6 +1029,14 @@ pub async fn ensure_deployment(
         }),
         ..Default::default()
     };
+
+    if let Some(pod) = dep
+        .spec
+        .as_mut()
+        .and_then(|spec| spec.template.spec.as_mut())
+    {
+        super::monitoring::apply_web_monitoring(pod, instance);
+    }
 
     deployments
         .patch(

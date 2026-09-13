@@ -45,6 +45,7 @@ test-scripts:
 		echo "=== $$t ==="; \
 		bash "$$t" || exit $$?; \
 	done
+	python3 scripts/tests/test-monitoring-exporter.py
 
 ## Docker-backed PostgreSQL integration tests for PgPostgresManager (requires docker)
 test-postgres:

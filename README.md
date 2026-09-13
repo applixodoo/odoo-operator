@@ -121,6 +121,33 @@ module. To skip auto-init (e.g. when restoring from a backup), set
 | `webhook.url` | — | URL to receive status change callbacks |
 | `affinity` | operator default | Pod affinity rules |
 | `tolerations` | operator default | Pod tolerations |
+| `monitoring.exporterImage` | disabled | Official `prom/statsd-exporter` semver image pinned by SHA-256; production web pods only |
+| `monitoring.configMapName` | — | Existing immutable, content-addressed ConfigMap containing `statsd-mapping.yml` |
+
+### Production HTTP monitoring
+
+The hosting platform supplies the server-wide Odoo instrumentation addon and the
+mapping ConfigMap before enabling `spec.monitoring`. The operator adds the local
+Unix datagram exporter only to web pods. Cron and job pods remain unchanged.
+The state directory `/run/droggol-monitoring` is a bounded 16Mi memory `emptyDir`,
+shared only between Odoo and its exporter. The exporter requests 10m CPU / 32Mi RAM,
+with limits of 100m / 128Mi and `GOMEMLIMIT=96MiB`; budget this additional pod usage.
+Metrics port 9102 is not added to any Service or ingress. The hosting platform must
+permit only its collector through network policy. It must also ensure the addon
+enforces a hard endpoint cardinality bound; an exporter mapping cache is not a cap.
+
+A shell supervisor restarts the exporter child after two seconds, removes stale
+sockets before startup, and forwards termination. Exporter process failure does not
+fail Odoo readiness. A whole-container OOM or image/config-volume startup failure
+can still affect pod readiness; verify worst-case series memory and restart behavior
+before rollout. No exporter readiness/liveness probe weakens Odoo's own probes.
+Changing the content-addressed ConfigMap name triggers a pod rollout; removing
+`monitoring` removes all exporter resources on reconciliation.
+
+`droggol.sh/server-id`, `droggol.sh/project-id` and `droggol.sh/instance-id` labels
+from the instance are copied to owned pods, leaving existing app selectors intact.
+Run the real image lifecycle check with
+`python3 scripts/tests/test-monitoring-exporter.py` (Docker required).
 
 ### Web/Cron Split
 
