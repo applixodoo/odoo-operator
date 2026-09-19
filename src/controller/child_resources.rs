@@ -10,8 +10,9 @@ use k8s_openapi::api::{
     apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy},
     core::v1::{
         ConfigMap, Container, ContainerPort, EnvVar, ExecAction, HTTPGetAction,
-        PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, Secret,
-        Service, ServicePort, ServiceSpec, TypedObjectReference, VolumeResourceRequirements,
+        PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe,
+        Secret, Service, ServicePort, ServiceSpec, TypedObjectReference,
+        VolumeResourceRequirements,
     },
     networking::v1::{
         HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -24,7 +25,10 @@ use k8s_openapi::apimachinery::pkg::{
     util::intstr::IntOrString,
 };
 use k8s_openapi::ByteString;
-use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams, ResourceExt};
+use kube::api::{
+    Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions,
+    ResourceExt,
+};
 use kube::Client;
 use serde_json::json;
 
@@ -33,8 +37,10 @@ use gateway_api::apis::standard::httproutes::{
     HTTPRouteRulesMatches, HTTPRouteRulesMatchesPath, HTTPRouteRulesMatchesPathType, HTTPRouteSpec,
 };
 
-use crate::crd::odoo_instance::{DeploymentStrategyType, Environment, GatewayRef, OdooInstance};
-use crate::error::Result;
+use crate::crd::odoo_instance::{
+    DeploymentStrategyType, Environment, GatewayRef, OdooInstance, WorkloadLayout,
+};
+use crate::error::{Error, Result};
 use crate::helpers::{
     build_odoo_conf, db_name, generate_password, odoo_ro_username, odoo_username, parse_quantity,
     sha256_hex,
@@ -857,6 +863,57 @@ pub async fn ensure_ingress(
     Ok(())
 }
 
+fn cron_container(name: &str, image: &str, instance: &OdooInstance) -> Container {
+    let startup_cmd = vec![
+        "/usr/bin/python3".to_string(),
+        "-I".to_string(),
+        "-S".to_string(),
+        "/usr/local/bin/dsh-cron-probe".to_string(),
+        "startup".to_string(),
+    ];
+    let liveness_cmd = vec![
+        "/usr/bin/python3".to_string(),
+        "-I".to_string(),
+        "-S".to_string(),
+        "/usr/local/bin/dsh-cron-probe".to_string(),
+        "liveness".to_string(),
+    ];
+
+    apply_extra_env(
+        Container {
+            name: format!("odoo-cron-{name}"),
+            image: Some(image.to_string()),
+            image_pull_policy: Some("IfNotPresent".to_string()),
+            command: Some(odoo_command(instance, &["--workers", "0", "--no-http"])),
+            env: Some(vec![env("PGDATABASE", db_name(instance))]),
+            volume_mounts: Some(odoo_volume_mounts_for(instance)),
+            resources: instance.spec.cron.resources.clone(),
+            startup_probe: Some(Probe {
+                initial_delay_seconds: Some(5),
+                period_seconds: Some(10),
+                timeout_seconds: Some(5),
+                failure_threshold: Some(30),
+                exec: Some(ExecAction {
+                    command: Some(startup_cmd),
+                }),
+                ..Default::default()
+            }),
+            liveness_probe: Some(Probe {
+                initial_delay_seconds: Some(300),
+                period_seconds: Some(30),
+                timeout_seconds: Some(5),
+                failure_threshold: Some(3),
+                exec: Some(ExecAction {
+                    command: Some(liveness_cmd),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        instance,
+    )
+}
+
 pub async fn ensure_deployment(
     client: &Client,
     ns: &str,
@@ -1035,6 +1092,9 @@ pub async fn ensure_deployment(
         .as_mut()
         .and_then(|spec| spec.template.spec.as_mut())
     {
+        if instance.spec.workload_layout == WorkloadLayout::Combined {
+            pod.containers.push(cron_container(name, image, instance));
+        }
         super::monitoring::apply_web_monitoring(pod, instance);
     }
 
@@ -1202,10 +1262,6 @@ pub async fn ensure_cron_deployment(
         DeploymentStrategyType::RollingUpdate => "RollingUpdate",
     };
 
-    // Override PGDATABASE (see ensure_deployment for rationale).
-    let db = db_name(instance);
-    let pg_env = vec![env("PGDATABASE", &db)];
-
     // Hash odoo.conf for rollout trigger.
     let conf_hash = sha256_hex(&read_odoo_conf_for_hash(client, ns, name, instance).await?);
 
@@ -1254,62 +1310,7 @@ pub async fn ensure_cron_deployment(
                         v.extend(source_volumes(instance));
                         v
                     }),
-                    containers: vec![{
-                        // Cron pods run --no-http so there is no HTTP endpoint
-                        // for probes.  Instead we query PostgreSQL directly to
-                        // detect a stuck cron system.
-                        let startup_cmd = vec![
-                            "/usr/bin/python3".to_string(),
-                            "-I".to_string(),
-                            "-S".to_string(),
-                            "/usr/local/bin/dsh-cron-probe".to_string(),
-                            "startup".to_string(),
-                        ];
-                        let liveness_cmd = vec![
-                            "/usr/bin/python3".to_string(),
-                            "-I".to_string(),
-                            "-S".to_string(),
-                            "/usr/local/bin/dsh-cron-probe".to_string(),
-                            "liveness".to_string(),
-                        ];
-
-                        apply_extra_env(
-                            Container {
-                                name: format!("odoo-cron-{name}"),
-                                image: Some(image.to_string()),
-                                image_pull_policy: Some("IfNotPresent".to_string()),
-                                command: Some(odoo_command(
-                                    instance,
-                                    &["--workers", "0", "--no-http"],
-                                )),
-                                env: Some(pg_env),
-                                volume_mounts: Some(odoo_volume_mounts_for(instance)),
-                                resources: instance.spec.cron.resources.clone(),
-                                startup_probe: Some(Probe {
-                                    initial_delay_seconds: Some(5),
-                                    period_seconds: Some(10),
-                                    timeout_seconds: Some(5),
-                                    failure_threshold: Some(30),
-                                    exec: Some(ExecAction {
-                                        command: Some(startup_cmd),
-                                    }),
-                                    ..Default::default()
-                                }),
-                                liveness_probe: Some(Probe {
-                                    initial_delay_seconds: Some(300),
-                                    period_seconds: Some(30),
-                                    timeout_seconds: Some(5),
-                                    failure_threshold: Some(3),
-                                    exec: Some(ExecAction {
-                                        command: Some(liveness_cmd),
-                                    }),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            },
-                            instance,
-                        )
-                    }],
+                    containers: vec![cron_container(name, image, instance)],
                     ..Default::default()
                 }),
             },
@@ -1326,6 +1327,106 @@ pub async fn ensure_cron_deployment(
         )
         .await?;
     Ok(())
+}
+
+pub async fn retire_owned_cron_deployment(
+    client: &Client,
+    ns: &str,
+    instance: &OdooInstance,
+    oref: &OwnerReference,
+) -> Result<bool> {
+    let name = cron_depl_name(instance);
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), ns);
+    if let Some(deployment) = deployments.get_opt(&name).await? {
+        if !deployment_controlled_by(&deployment, oref) {
+            return Err(Error::config(format!(
+                "refusing to retire Deployment {ns}/{name}: it is not controlled by this OdooInstance"
+            )));
+        }
+        if deployment.metadata.deletion_timestamp.is_none() {
+            let uid = deployment.metadata.uid.clone().ok_or_else(|| {
+                Error::config(format!("Deployment {ns}/{name} has no metadata.uid"))
+            })?;
+            let patched = scale_deployment_if_current(client, ns, &deployment, 0).await?;
+            let patched_resource_version = patched.metadata.resource_version.ok_or_else(|| {
+                Error::config(format!(
+                    "patched Deployment {ns}/{name} has no metadata.resourceVersion"
+                ))
+            })?;
+            deployments
+                .delete(
+                    &name,
+                    &DeleteParams::foreground().preconditions(Preconditions {
+                        uid: Some(uid),
+                        resource_version: Some(patched_resource_version),
+                    }),
+                )
+                .await?;
+        }
+        return Ok(false);
+    }
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    Ok(pods
+        .list(&ListParams::default().labels(&format!("app={name}")))
+        .await?
+        .items
+        .is_empty())
+}
+
+pub(crate) async fn scale_deployment_if_current(
+    client: &Client,
+    ns: &str,
+    deployment: &Deployment,
+    replicas: i32,
+) -> Result<Deployment> {
+    let name = deployment.metadata.name.as_deref().ok_or_else(|| {
+        Error::config(format!("Deployment in namespace {ns} has no metadata.name"))
+    })?;
+    let uid = deployment
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| Error::config(format!("Deployment {ns}/{name} has no metadata.uid")))?;
+    let resource_version = deployment
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| {
+            Error::config(format!(
+                "Deployment {ns}/{name} has no metadata.resourceVersion"
+            ))
+        })?;
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), ns);
+    Ok(deployments
+        .patch(
+            name,
+            &PatchParams::apply(FIELD_MANAGER),
+            &Patch::Merge(&json!({
+                "metadata": {
+                    "uid": uid,
+                    "resourceVersion": resource_version,
+                },
+                "spec": {"replicas": replicas},
+            })),
+        )
+        .await?)
+}
+
+pub fn deployment_controlled_by(deployment: &Deployment, oref: &OwnerReference) -> bool {
+    deployment
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|owner| {
+            owner.controller == Some(true)
+                && owner.api_version == oref.api_version
+                && owner.kind == oref.kind
+                && owner.name == oref.name
+                && owner.uid == oref.uid
+        })
 }
 
 // ── Read-only SQL access ──────────────────────────────────────────────────────

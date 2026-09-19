@@ -7,7 +7,7 @@ use kube::CustomResourceExt;
 
 use odoo_operator::crd::odoo_backup_job::OdooBackupJob;
 use odoo_operator::crd::odoo_init_job::OdooInitJob;
-use odoo_operator::crd::odoo_instance::OdooInstance;
+use odoo_operator::crd::odoo_instance::{OdooInstance, WorkloadLayout};
 use odoo_operator::crd::odoo_restore_job::OdooRestoreJob;
 use odoo_operator::crd::odoo_upgrade_job::OdooUpgradeJob;
 
@@ -24,6 +24,30 @@ fn test_odoo_instance_crd_generates_valid_schema() {
     assert_eq!(spec.names.plural, "odooinstances");
     assert_eq!(spec.names.short_names.as_ref().unwrap(), &["odoo"]);
     assert_eq!(spec.scope, "Namespaced");
+}
+
+#[test]
+fn workload_layout_defaults_to_separate() {
+    let instance: OdooInstance = serde_json::from_value(serde_json::json!({
+        "apiVersion": "bemade.org/v1alpha1",
+        "kind": "OdooInstance",
+        "metadata": { "name": "test" },
+        "spec": {
+            "adminPassword": "admin",
+            "ingress": { "hosts": ["test.example.com"] }
+        }
+    }))
+    .unwrap();
+    assert_eq!(instance.spec.workload_layout, WorkloadLayout::Separate);
+
+    let schema = serde_json::to_value(OdooInstance::crd()).unwrap();
+    let layout = schema
+        .pointer(
+            "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/workloadLayout",
+        )
+        .unwrap();
+    assert_eq!(layout["default"], "separate");
+    assert_eq!(layout["enum"], serde_json::json!(["separate", "combined"]));
 }
 
 #[test]

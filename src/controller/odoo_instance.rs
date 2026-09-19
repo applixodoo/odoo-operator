@@ -31,7 +31,9 @@ use tracing::{debug, info, warn};
 
 use crate::crd::odoo_backup_job::OdooBackupJob;
 use crate::crd::odoo_init_job::OdooInitJob;
-use crate::crd::odoo_instance::{DatabaseMissingPolicy, OdooInstance, OdooInstancePhase};
+use crate::crd::odoo_instance::{
+    DatabaseMissingPolicy, OdooInstance, OdooInstancePhase, WorkloadLayout,
+};
 use crate::crd::odoo_restore_job::OdooRestoreJob;
 use crate::crd::odoo_staging_refresh_job::OdooStagingRefreshJob;
 use crate::crd::odoo_upgrade_job::OdooUpgradeJob;
@@ -385,9 +387,17 @@ async fn reconcile_instance(instance: &OdooInstance, ctx: &Context) -> Result<Ac
     child_resources::ensure_config_map(client, &ns, &name, instance, &pg_cluster, &oref).await?;
     child_resources::ensure_service(client, &ns, &name, &oref).await?;
     child_resources::ensure_routing(client, &ns, &name, instance, &oref).await?;
+    if instance.spec.workload_layout == WorkloadLayout::Combined
+        && !child_resources::retire_owned_cron_deployment(client, &ns, instance, &oref).await?
+    {
+        return Ok(Action::requeue(Duration::from_secs(1)));
+    }
     if !is_migrating_filestore {
         child_resources::ensure_deployment(client, &ns, &name, instance, ctx, &oref).await?;
-        child_resources::ensure_cron_deployment(client, &ns, &name, instance, ctx, &oref).await?;
+        if instance.spec.workload_layout == WorkloadLayout::Separate {
+            child_resources::ensure_cron_deployment(client, &ns, &name, instance, ctx, &oref)
+                .await?;
+        }
     }
 
     // Read-only SQL access — provision or tear down based on spec opt-in.
@@ -676,6 +686,7 @@ async fn reconcile_instance(instance: &OdooInstance, ctx: &Context) -> Result<Ac
 async fn cleanup_instance(instance: &OdooInstance, ctx: &Context) -> Result<Action> {
     let ns = instance.namespace().unwrap_or_default();
     let name = instance.name_any();
+    let oref = controller_owner_ref(instance);
     info!(%name, %ns, "cleaning up OdooInstance (deleting postgres role)");
 
     publish_event(
@@ -699,9 +710,25 @@ async fn cleanup_instance(instance: &OdooInstance, ctx: &Context) -> Result<Acti
     // Best-effort: a scale error (e.g. the Deployment is already gone, 404) must
     // not block role cleanup.  If pods are genuinely still up when we reach the
     // DROP below, `delete_role` fails and the finalizer retries on the next tick.
-    for depl in [name.clone(), cron_depl_name(instance)] {
-        if let Err(e) = scale_deployment(&ctx.client, &depl, &ns, 0).await {
-            warn!(%name, %depl, %e, "failed to scale down deployment during cleanup (non-fatal)");
+    if let Err(e) = scale_deployment(&ctx.client, &name, &ns, 0).await {
+        warn!(%name, %e, "failed to scale down web deployment during cleanup (non-fatal)");
+    }
+    let cron_name = cron_depl_name(instance);
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
+    match deployments.get(&cron_name).await {
+        Ok(deployment) if child_resources::deployment_controlled_by(&deployment, &oref) => {
+            if let Err(e) =
+                child_resources::scale_deployment_if_current(&ctx.client, &ns, &deployment, 0).await
+            {
+                warn!(%name, depl = %cron_name, %e, "failed to scale down cron deployment during cleanup (non-fatal)");
+            }
+        }
+        Ok(_) => {
+            warn!(%name, depl = %cron_name, "refusing to scale foreign cron deployment during cleanup");
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {}
+        Err(e) => {
+            warn!(%name, depl = %cron_name, %e, "failed to inspect cron deployment during cleanup (non-fatal)");
         }
     }
 

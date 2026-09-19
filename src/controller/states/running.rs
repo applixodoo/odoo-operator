@@ -3,7 +3,7 @@ use tracing::info;
 
 use crate::controller::helpers::cron_depl_name;
 use crate::controller::state_machine::scale_deployment;
-use crate::crd::odoo_instance::OdooInstance;
+use crate::crd::odoo_instance::{OdooInstance, WorkloadLayout};
 use crate::error::Result;
 
 use super::{Context, ReconcileSnapshot, State};
@@ -29,16 +29,18 @@ impl State for Running {
             scale_deployment(&ctx.client, name, ns, desired).await?;
         }
 
-        let desired = instance.spec.cron.replicas;
-        let cron_depl_name = cron_depl_name(instance);
-        info!(
-            desired = desired,
-            actual = snap.cron_deployment_replicas,
-            "cron replicas while reconciling running state."
-        );
-        if snap.cron_deployment_replicas != desired {
-            info!(%cron_depl_name, from = snap.cron_deployment_replicas, to = desired, "scaling cron deployment");
-            scale_deployment(&ctx.client, cron_depl_name.as_str(), ns, desired).await?;
+        if instance.spec.workload_layout == WorkloadLayout::Separate {
+            let desired = instance.spec.cron.replicas;
+            let cron_depl_name = cron_depl_name(instance);
+            info!(
+                desired = desired,
+                actual = snap.cron_deployment_replicas,
+                "cron replicas while reconciling running state."
+            );
+            if snap.cron_deployment_replicas != desired {
+                info!(%cron_depl_name, from = snap.cron_deployment_replicas, to = desired, "scaling cron deployment");
+                scale_deployment(&ctx.client, cron_depl_name.as_str(), ns, desired).await?;
+            }
         }
         Ok(())
     }

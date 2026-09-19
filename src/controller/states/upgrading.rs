@@ -11,7 +11,7 @@ use crate::controller::helpers::{
     FIELD_MANAGER,
 };
 use crate::controller::state_machine::scale_deployment;
-use crate::crd::odoo_instance::OdooInstance;
+use crate::crd::odoo_instance::{OdooInstance, WorkloadLayout};
 use crate::crd::odoo_upgrade_job::OdooUpgradeJob;
 use crate::error::Result;
 
@@ -31,8 +31,12 @@ impl State for Upgrading {
         snap: &ReconcileSnapshot,
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
-        // Scale only the cron deployment
-        scale_deployment(&ctx.client, cron_depl_name(instance).as_str(), &ns, 0).await?;
+        let deployment = if instance.spec.workload_layout == WorkloadLayout::Combined {
+            instance.name_any()
+        } else {
+            cron_depl_name(instance)
+        };
+        scale_deployment(&ctx.client, &deployment, &ns, 0).await?;
 
         let upgrade_job = match snap.active_upgrade_job {
             Some(ref uj) => uj,

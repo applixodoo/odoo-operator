@@ -344,6 +344,14 @@ pub struct CronSpec {
     pub resources: Option<ResourceRequirements>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkloadLayout {
+    #[default]
+    Separate,
+    Combined,
+}
+
 impl Default for CronSpec {
     fn default() -> Self {
         CronSpec {
@@ -497,6 +505,12 @@ fn default_init_modules() -> Vec<String> {
         .message(Message::Expression(
             "'spec.monitoring is supported only for Production'".into()
         )),
+    rule = Rule::new(
+        "!has(self.workloadLayout) || self.workloadLayout != 'combined' || self.cron.replicas == 1"
+    )
+        .message(Message::Expression(
+            "'spec.cron.replicas must be 1 when spec.workloadLayout is combined'".into()
+        )),
     rule = Rule::new("!has(self.sourceVolume) || !self.sourceVolume.odooBin.contains(' ')")
         .message(Message::Expression(
             "'spec.sourceVolume.odooBin must not contain whitespace'".into()
@@ -541,6 +555,12 @@ pub struct OdooInstanceSpec {
 
     #[serde(default = "default_replicas")]
     pub replicas: i32,
+
+    /// Place web and cron in separate Deployments, or as separate containers
+    /// in the web Deployment. Combined workloads follow `spec.replicas` and
+    /// require `spec.cron.replicas` to remain 1.
+    #[serde(default)]
+    pub workload_layout: WorkloadLayout,
 
     #[serde(default)]
     pub cron: CronSpec,

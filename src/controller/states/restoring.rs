@@ -18,11 +18,10 @@ use crate::notify;
 
 use super::{Context, ReconcileSnapshot, State};
 use crate::controller::helpers::{
-    apply_extra_env, cm_env, cron_depl_name, env, odoo_cmd_env, odoo_conf_mount, odoo_conf_volume,
-    pg_tools_image, source_volume_mounts, source_volumes, staging_mail_env_vars, OdooJobBuilder,
-    FIELD_MANAGER,
+    apply_extra_env, cm_env, env, odoo_cmd_env, odoo_conf_mount, odoo_conf_volume, pg_tools_image,
+    source_volume_mounts, source_volumes, staging_mail_env_vars, OdooJobBuilder, FIELD_MANAGER,
 };
-use crate::controller::state_machine::scale_deployment;
+use crate::controller::state_machine::scale_serving_deployments;
 
 const S3_DOWNLOAD_SCRIPT: &str = include_str!("../../../scripts/s3-download.sh");
 const ODOO_DOWNLOAD_SCRIPT: &str = include_str!("../../../scripts/odoo-download.sh");
@@ -58,9 +57,7 @@ impl State for Restoring {
         snap: &ReconcileSnapshot,
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
-        let inst_name = instance.name_any();
-        scale_deployment(&ctx.client, &inst_name, &ns, 0).await?;
-        scale_deployment(&ctx.client, cron_depl_name(instance).as_str(), &ns, 0).await?;
+        scale_serving_deployments(&ctx.client, instance, &ns, 0, 0).await?;
 
         let restore_job = match snap.active_restore_job {
             Some(ref rj) => rj,

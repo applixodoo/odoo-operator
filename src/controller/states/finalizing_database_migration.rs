@@ -14,9 +14,9 @@ use crate::crd::odoo_instance::OdooInstance;
 use crate::error::Result;
 use crate::helpers::odoo_username;
 
-use super::super::helpers::{cron_depl_name, FIELD_MANAGER};
+use super::super::helpers::FIELD_MANAGER;
 use super::super::odoo_instance::{load_postgres_cluster_by_name, Context};
-use super::super::state_machine::{scale_deployment, ReconcileSnapshot};
+use super::super::state_machine::{scale_serving_deployments, ReconcileSnapshot};
 use super::State;
 
 pub struct FinalizingDatabaseMigration;
@@ -30,12 +30,10 @@ impl State for FinalizingDatabaseMigration {
         _snapshot: &ReconcileSnapshot,
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
-        let inst_name = instance.name_any();
         let client = &ctx.client;
 
         // Keep both deployments at 0 until transition fires.
-        scale_deployment(client, &inst_name, &ns, 0).await?;
-        scale_deployment(client, &cron_depl_name(instance), &ns, 0).await?;
+        scale_serving_deployments(client, instance, &ns, 0, 0).await?;
 
         Ok(())
     }

@@ -1136,6 +1136,13 @@ spec:
                 required:
                 - url
                 type: object
+              workloadLayout:
+                default: separate
+                description: Place web and cron in separate Deployments, or as separate containers in the web Deployment. Combined workloads follow `spec.replicas` and require `spec.cron.replicas` to remain 1.
+                enum:
+                - separate
+                - combined
+                type: string
             required:
             - ingress
             type: object
@@ -1156,6 +1163,8 @@ spec:
               rule: '!has(self.sourceVolume) || self.sourceVolume.mounts.all(m, m.mountPath.startsWith(''/''))'
             - messageExpression: '''spec.monitoring is supported only for Production'''
               rule: '!has(self.monitoring) || self.environment == ''Production'''
+            - messageExpression: '''spec.cron.replicas must be 1 when spec.workloadLayout is combined'''
+              rule: '!has(self.workloadLayout) || self.workloadLayout != ''combined'' || self.cron.replicas == 1'
             - messageExpression: '''spec.sourceVolume.odooBin must not contain whitespace'''
               rule: '!has(self.sourceVolume) || !self.sourceVolume.odooBin.contains('' '')'
           status:

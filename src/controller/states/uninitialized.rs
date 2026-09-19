@@ -9,8 +9,8 @@ use crate::crd::odoo_staging_refresh_job::OdooStagingRefreshJob;
 use crate::error::{Error, Result};
 
 use super::{Context, ReconcileSnapshot, State};
-use crate::controller::helpers::{controller_owner_ref, cron_depl_name};
-use crate::controller::state_machine::{scale_deployment, JobStatus};
+use crate::controller::helpers::controller_owner_ref;
+use crate::controller::state_machine::{scale_serving_deployments, JobStatus};
 
 /// Uninitialized: waiting for an OdooInitJob, OdooRestoreJob, or
 /// OdooStagingRefreshJob to be created. Scale deployment to 0 (not yet
@@ -36,8 +36,7 @@ impl State for Uninitialized {
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
         let name = instance.name_any();
-        scale_deployment(&ctx.client, &name, &ns, 0).await?;
-        scale_deployment(&ctx.client, cron_depl_name(instance).as_str(), &ns, 0).await?;
+        scale_serving_deployments(&ctx.client, instance, &ns, 0, 0).await?;
 
         // Only auto-create when no job of any kind is already present and
         // the DB hasn't been initialized yet.

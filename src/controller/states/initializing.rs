@@ -11,10 +11,10 @@ use crate::error::Result;
 
 use super::{Context, ReconcileSnapshot, State};
 use crate::controller::helpers::FIELD_MANAGER;
-use crate::controller::state_machine::scale_deployment;
+use crate::controller::state_machine::scale_serving_deployments;
 
 use crate::controller::helpers::{
-    apply_extra_env, cron_depl_name, odoo_entrypoint, odoo_entrypoint_shell, odoo_probe_command,
+    apply_extra_env, odoo_entrypoint, odoo_entrypoint_shell, odoo_probe_command,
     odoo_volume_mounts_for, OdooJobBuilder,
 };
 
@@ -32,9 +32,7 @@ impl State for Initializing {
         snap: &ReconcileSnapshot,
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
-        let name = instance.name_any();
-        scale_deployment(&ctx.client, &name, &ns, 0).await?;
-        scale_deployment(&ctx.client, cron_depl_name(instance).as_str(), &ns, 0).await?;
+        scale_serving_deployments(&ctx.client, instance, &ns, 0, 0).await?;
 
         if let Some(ref init_job) = snap.active_init_job {
             let crd_name = init_job.name_any();
