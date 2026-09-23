@@ -91,7 +91,8 @@ module. To skip auto-init (e.g. when restoring from a backup), set
 | Field | Default | Description |
 |---|---|---|
 | `image` | operator default | Odoo container image |
-| `replicas` | `1` | Number of web pods. Set to `0` to stop the instance |
+| `replicas` | `1` | Number of web pods, or combined web/cron pods. Set to `0` to stop the instance |
+| `workloadLayout` | `separate` | `separate` creates web and cron Deployments; `combined` puts web and cron containers in one Deployment |
 | `adminPassword` | — | Odoo master password |
 | `imagePullSecret` | — | Name of a `kubernetes.io/dockerconfigjson` secret in the operator namespace (auto-copied to instance namespace) |
 | `ingress.hosts` | — | Hostnames to expose the instance on |
@@ -109,7 +110,7 @@ module. To skip auto-init (e.g. when restoring from a backup), set
 | `filestore.storageSize` | `2Gi` | PVC size. Can only be increased, not decreased |
 | `filestore.storageClass` | operator default | StorageClass for the filestore PVC. Immutable after creation |
 | `resources` | operator default | CPU/memory requests and limits for web pods |
-| `cron.replicas` | `1` | Number of cron pods (see [Web/Cron Split](#webcron-split) below) |
+| `cron.replicas` | `1` | Number of cron pods in `separate` layout. Must remain `1` in `combined` layout |
 | `cron.resources` | same as `resources` | CPU/memory requests and limits for cron pods |
 | `strategy.type` | `Recreate` | Deployment strategy (`Recreate` or `RollingUpdate`) |
 | `strategy.rollingUpdate.maxUnavailable` | `25%` | Max unavailable pods during rolling update |
@@ -151,17 +152,28 @@ Run the real image lifecycle check with
 
 ### Web/Cron Split
 
-Each OdooInstance creates two Deployments:
+By default, each OdooInstance uses `workloadLayout: separate` and creates two
+Deployments:
 
 - **Web** (`<name>`) — runs with `--max-cron-threads=0`, serves HTTP traffic on
   ports 8069 and 8072 (websocket). Scaled by `spec.replicas`.
 - **Cron** (`<name>-cron`) — runs with `--no-http`, processes scheduled actions
   only. Scaled by `spec.cron.replicas`.
 
-This separation means you can scale web workers independently of cron processing.
-Cron pods don't need an HTTP port, so they have no service or ingress routing. During
-upgrades and restores, the cron deployment is automatically scaled to zero to avoid
-stale connections.
+This separation lets you scale web workers independently of cron processing. Cron
+pods don't need an HTTP port, so they have no service or ingress routing. During an
+upgrade, the cron Deployment is scaled to zero while the web Deployment keeps serving.
+
+With `workloadLayout: combined`, the web and cron containers share the `<name>`
+Deployment and Pod. `spec.replicas` scales the whole workload and
+`spec.cron.replicas` must be `1`. Upgrades scale the combined Deployment to zero.
+
+To change layouts, first set `spec.replicas: 0` and wait for
+`status.phase: Stopped`. Keep replicas at zero while changing `workloadLayout`; the
+validating webhook rejects any other transition. When moving to `combined`, the
+operator scales the old cron Deployment to zero, deletes it, waits for both the
+Deployment and its Pods to disappear, and only then updates the web Pod template.
+Set `spec.replicas` to the desired value after the conversion finishes.
 
 You don't need to set `workers` or `max_cron_threads` in `configOptions` — the
 operator handles this automatically via the command-line flags on each deployment.

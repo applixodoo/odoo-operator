@@ -10,7 +10,9 @@
 //! The fix scales both Deployments to 0 as the first step of cleanup.  This
 //! test asserts that scale-down happens when a Running instance is deleted.
 
-use kube::api::{Api, DeleteParams};
+use k8s_openapi::api::apps::v1::Deployment;
+use kube::api::{Api, DeleteParams, PostParams};
+use serde_json::json;
 
 use super::common::*;
 use odoo_operator::crd::odoo_instance::OdooInstance;
@@ -79,5 +81,66 @@ async fn cleanup_scales_deployments_down_on_delete() -> anyhow::Result<()> {
     // Clear the fault so the instance can finish cleaning up on teardown.
     mock_pg().clear_delete_role_failure(&username);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_scales_combined_deployment_without_touching_foreign_cron() -> anyhow::Result<()> {
+    let ctx = TestContext::new_ns().await;
+    let (client, ns) = (&ctx.client, ctx.ns.as_str());
+    let name = "test-combined-cleanup";
+    let cron_name = format!("{name}-cron");
+    let instances: Api<OdooInstance> = Api::namespaced(client.clone(), ns);
+    let mut instance = test_instance_json(name, ns, 1);
+    instance["spec"]["workloadLayout"] = json!("combined");
+    instances
+        .create(&PostParams::default(), &serde_json::from_value(instance)?)
+        .await?;
+
+    let ready_handle = fast_track_to_running(&ctx, "init-combined-cleanup").await;
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), ns);
+    let foreign_cron: Deployment = serde_json::from_value(json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": cron_name, "namespace": ns},
+        "spec": {
+            "replicas": 3,
+            "selector": {"matchLabels": {"app": cron_name}},
+            "template": {
+                "metadata": {"labels": {"app": cron_name}},
+                "spec": {"containers": [{"name": "foreign", "image": "busybox"}]}
+            }
+        }
+    }))?;
+    deployments
+        .create(&PostParams::default(), &foreign_cron)
+        .await?;
+
+    let username = odoo_username(ns, name);
+    mock_pg().fail_delete_role(&username, "database still has sessions (test injection)");
+    ready_handle.abort();
+    instances.delete(name, &DeleteParams::default()).await?;
+
+    assert!(
+        wait_for(TIMEOUT, POLL, || async {
+            check_deployment_scale(client, ns, name, 0).await.is_ok()
+                && check_deployment_scale(client, ns, &cron_name, 3)
+                    .await
+                    .is_ok()
+        })
+        .await
+    );
+    let instance = instances
+        .get_opt(name)
+        .await?
+        .expect("instance should still exist while delete_role fails");
+    assert!(instance
+        .metadata
+        .finalizers
+        .unwrap_or_default()
+        .iter()
+        .any(|finalizer| finalizer == FINALIZER));
+
+    mock_pg().clear_delete_role_failure(&username);
     Ok(())
 }

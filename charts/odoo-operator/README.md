@@ -176,6 +176,7 @@ metadata:
 spec:
   image: odoo:18.0
   replicas: 1
+  workloadLayout: separate
   adminPassword: "admin-password"
   ingress:
     hosts:
@@ -185,6 +186,13 @@ spec:
     cluster: main  # Optional: specify which PostgreSQL cluster to use
     name: my-odoo  # Optional: custom database name (defaults to odoo_<uid>)
 ```
+
+`workloadLayout` defaults to `separate`, which creates independent web and cron
+Deployments. Set it to `combined` to run web and cron containers in the same Pod;
+the whole workload then follows `spec.replicas` and `spec.cron.replicas` must be
+`1`. To change layouts, set `spec.replicas: 0`, wait for
+`status.phase: Stopped`, change `workloadLayout` while replicas remain zero, then
+scale the instance back up.
 
 ### OdooInitJob
 

@@ -37,6 +37,7 @@ fn base_instance(name: &str) -> OdooInstance {
             admin_password: Some("admin".to_string()),
             admin_password_secret_ref: None,
             replicas: 1,
+            workload_layout: Default::default(),
             cron: CronSpec {
                 replicas: 1,
                 resources: None,

@@ -24,11 +24,10 @@ use crate::{controller::child_resources, crd::odoo_instance::OdooInstance};
 
 use super::{Context, ReconcileSnapshot, State};
 use crate::controller::helpers::{
-    apply_extra_env, cm_env, controller_owner_ref, cron_depl_name, env, odoo_cmd_env,
-    odoo_volume_mounts, odoo_volume_mounts_for, pg_tools_image, staging_mail_env_vars,
-    OdooJobBuilder, FIELD_MANAGER,
+    apply_extra_env, cm_env, controller_owner_ref, env, odoo_cmd_env, odoo_volume_mounts,
+    odoo_volume_mounts_for, pg_tools_image, staging_mail_env_vars, OdooJobBuilder, FIELD_MANAGER,
 };
-use crate::controller::state_machine::scale_deployment;
+use crate::controller::state_machine::scale_serving_deployments;
 use crate::helpers::sha256_hex;
 
 const CLONE_DB_SCRIPT: &str = include_str!("../../../scripts/clone-db.sh");
@@ -221,8 +220,7 @@ impl State for CloningFromSource {
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
         let inst_name = instance.name_any();
-        scale_deployment(&ctx.client, &inst_name, &ns, 0).await?;
-        scale_deployment(&ctx.client, cron_depl_name(instance).as_str(), &ns, 0).await?;
+        scale_serving_deployments(&ctx.client, instance, &ns, 0, 0).await?;
 
         let Some(refresh) = snap.active_refresh_job.as_ref() else {
             return Ok(());

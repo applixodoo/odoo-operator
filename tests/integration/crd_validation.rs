@@ -77,6 +77,24 @@ async fn monitoring_requires_production_and_a_pinned_official_exporter() {
 }
 
 #[tokio::test]
+async fn combined_layout_requires_one_cron_replica() {
+    let ctx = TestContext::new_ns().await;
+    for (name, layout, cron_replicas, accepted) in [
+        ("layout-combined", "combined", 1, true),
+        ("layout-combined-zero", "combined", 0, false),
+        ("layout-combined-many", "combined", 2, false),
+        ("layout-separate-zero", "separate", 0, true),
+    ] {
+        let body = instance_with_spec(name, &ctx.ns, |spec| {
+            spec["workloadLayout"] = json!(layout);
+            spec["cron"] = json!({"replicas": cron_replicas});
+        });
+        let result = try_create(&ctx.client, &ctx.ns, body).await;
+        assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+    }
+}
+
+#[tokio::test]
 async fn admin_password_plaintext_alone_is_accepted() {
     let ctx = TestContext::new_ns().await;
     let body = instance_with_spec("pw-plain", &ctx.ns, |_| {});

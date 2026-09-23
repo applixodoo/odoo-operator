@@ -15,7 +15,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 use warp::Filter;
 
-use crate::crd::odoo_instance::OdooInstance;
+use crate::crd::odoo_instance::{OdooInstance, OdooInstancePhase, WorkloadLayout};
 use crate::helpers::parse_quantity;
 use crate::tls::spawn_reloading_resolver;
 
@@ -130,6 +130,11 @@ fn admin_password_violation(instance: &OdooInstance) -> Option<String> {
     }
 }
 
+fn workload_layout_violation(instance: &OdooInstance) -> Option<String> {
+    (instance.spec.workload_layout == WorkloadLayout::Combined && instance.spec.cron.replicas != 1)
+        .then(|| "spec.cron.replicas must be 1 when spec.workloadLayout is combined".to_string())
+}
+
 /// Validate an OdooInstance admission request.
 fn validate(req: AdmissionRequest<OdooInstance>) -> AdmissionResponse {
     // The master-password XOR is checked for any object the request carries,
@@ -137,6 +142,9 @@ fn validate(req: AdmissionRequest<OdooInstance>) -> AdmissionResponse {
     // old object, but this one is a property of the new object alone.
     if let Some(ref new) = req.object {
         if let Some(msg) = admin_password_violation(new) {
+            return AdmissionResponse::from(&req).deny(msg);
+        }
+        if let Some(msg) = workload_layout_violation(new) {
             return AdmissionResponse::from(&req).deny(msg);
         }
     }
@@ -154,6 +162,17 @@ fn validate(req: AdmissionRequest<OdooInstance>) -> AdmissionResponse {
         Some(ref obj) => obj,
         None => return AdmissionResponse::from(&req),
     };
+
+    if old.spec.workload_layout != new.spec.workload_layout
+        && (old.spec.replicas != 0
+            || new.spec.replicas != 0
+            || old.status.as_ref().and_then(|status| status.phase.as_ref())
+                != Some(&OdooInstancePhase::Stopped))
+    {
+        return AdmissionResponse::from(&req).deny(
+            "spec.workloadLayout can change only from a Stopped instance while old and new spec.replicas are 0",
+        );
+    }
 
     // 1. Reject storage size decreases — PVCs cannot shrink.
     if let (Some(old_fs), Some(new_fs)) = (&old.spec.filestore, &new.spec.filestore) {
@@ -410,6 +429,41 @@ mod tests {
         ar.try_into().expect("valid AdmissionRequest")
     }
 
+    fn make_layout_change_request(
+        old_replicas: i32,
+        new_replicas: i32,
+        old_phase: &str,
+        cron_replicas: i32,
+    ) -> AdmissionRequest<OdooInstance> {
+        let mut old_obj = make_instance_json(None, None);
+        old_obj["spec"]["replicas"] = serde_json::json!(old_replicas);
+        old_obj["spec"]["workloadLayout"] = serde_json::json!("separate");
+        old_obj["status"] = serde_json::json!({"phase": old_phase});
+        let mut new_obj = make_instance_json(None, None);
+        new_obj["spec"]["replicas"] = serde_json::json!(new_replicas);
+        new_obj["spec"]["workloadLayout"] = serde_json::json!("combined");
+        new_obj["spec"]["cron"] = serde_json::json!({"replicas": cron_replicas});
+        let review = serde_json::json!({
+            "apiVersion": "admission.k8s.io/v1",
+            "kind": "AdmissionReview",
+            "request": {
+                "uid": "req-layout",
+                "kind": { "group": "bemade.org", "version": "v1alpha1", "kind": "OdooInstance" },
+                "resource": { "group": "bemade.org", "version": "v1alpha1", "resource": "odooinstances" },
+                "name": "test",
+                "namespace": "default",
+                "operation": "UPDATE",
+                "userInfo": { "username": "test" },
+                "object": new_obj,
+                "oldObject": old_obj,
+                "dryRun": false,
+            }
+        });
+        let review: kube::core::admission::AdmissionReview<OdooInstance> =
+            serde_json::from_value(review).expect("valid AdmissionReview");
+        review.try_into().expect("valid AdmissionRequest")
+    }
+
     #[test]
     fn test_parse_quantity() {
         assert_eq!(parse_quantity("2Gi").unwrap(), 2 * 1024 * 1024 * 1024);
@@ -436,6 +490,28 @@ mod tests {
         let req = make_update_request(Some("mydb"), None, Some("mydb"), None);
         let resp = validate(req);
         assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_rejects_combined_with_nonstandard_cron_replicas() {
+        let response = validate(make_layout_change_request(0, 0, "Stopped", 2));
+        assert!(!response.allowed);
+    }
+
+    #[test]
+    fn test_validate_rejects_layout_change_before_stopped_boundary() {
+        for request in [
+            make_layout_change_request(1, 0, "Running", 1),
+            make_layout_change_request(0, 0, "Running", 1),
+            make_layout_change_request(0, 1, "Stopped", 1),
+        ] {
+            assert!(!validate(request).allowed);
+        }
+    }
+
+    #[test]
+    fn test_validate_allows_layout_change_while_stopped_at_zero() {
+        assert!(validate(make_layout_change_request(0, 0, "Stopped", 1)).allowed);
     }
 
     #[test]

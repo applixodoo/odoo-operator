@@ -7,8 +7,7 @@ use crate::crd::odoo_instance::OdooInstance;
 use crate::error::Result;
 
 use super::{Context, ReconcileSnapshot, State};
-use crate::controller::helpers::cron_depl_name;
-use crate::controller::state_machine::scale_deployment;
+use crate::controller::state_machine::scale_serving_deployments;
 
 /// Starting: scale deployment to spec.replicas, waiting for pods to be ready.
 ///
@@ -31,7 +30,6 @@ impl State for Starting {
         snap: &ReconcileSnapshot,
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
-        let name = instance.name_any();
         // Honor spec.replicas verbatim — it is the authoritative replica count
         // owned by whoever writes the `scale` subresource (a human or an HPA).
         // No `.max(1)` floor: replicas == 0 is a valid request and is handled by
@@ -39,14 +37,7 @@ impl State for Starting {
         // here would only transiently override an external autoscaler.
         let replicas = instance.spec.replicas;
         let cron_replicas = instance.spec.cron.replicas;
-        scale_deployment(&ctx.client, &name, &ns, replicas).await?;
-        scale_deployment(
-            &ctx.client,
-            cron_depl_name(instance).as_str(),
-            &ns,
-            cron_replicas,
-        )
-        .await?;
+        scale_serving_deployments(&ctx.client, instance, &ns, replicas, cron_replicas).await?;
 
         if !snap.stuck_mount_pods.is_empty() {
             recover_stuck_mounts(&ctx.client, &ns, &snap.stuck_mount_pods).await;

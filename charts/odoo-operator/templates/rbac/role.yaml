@@ -84,7 +84,7 @@ rules:
   # Deployments
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # Jobs (created by and owned by job CRs)
   - apiGroups: ["batch"]

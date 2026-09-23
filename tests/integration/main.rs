@@ -29,3 +29,4 @@ mod restore_job;
 mod scaling;
 mod staging_refresh;
 mod upgrade_job;
+mod workload_layout;

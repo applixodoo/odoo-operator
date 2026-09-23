@@ -24,7 +24,7 @@ use tracing::info;
 
 use crate::crd::odoo_backup_job::OdooBackupJob;
 use crate::crd::odoo_init_job::OdooInitJob;
-use crate::crd::odoo_instance::{OdooInstance, OdooInstancePhase};
+use crate::crd::odoo_instance::{OdooInstance, OdooInstancePhase, WorkloadLayout};
 use crate::crd::odoo_restore_job::OdooRestoreJob;
 use crate::crd::odoo_staging_refresh_job::OdooStagingRefreshJob;
 use crate::crd::odoo_upgrade_job::OdooUpgradeJob;
@@ -175,16 +175,19 @@ impl ReconcileSnapshot {
         };
 
         // Cron replicas (spec + ready).
-        let (cron_deployment_replicas, cron_ready_replicas) = {
-            let deps: Api<Deployment> = Api::namespaced(client.clone(), ns);
-            match deps.get(cron_depl_name(instance).as_str()).await {
-                Ok(dep) => (
-                    dep.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0),
-                    dep.status.and_then(|s| s.ready_replicas).unwrap_or(0),
-                ),
-                Err(_) => (0, 0),
-            }
-        };
+        let (cron_deployment_replicas, cron_ready_replicas) =
+            if instance.spec.workload_layout == WorkloadLayout::Combined {
+                (deployment_replicas, ready_replicas)
+            } else {
+                let deps: Api<Deployment> = Api::namespaced(client.clone(), ns);
+                match deps.get(cron_depl_name(instance).as_str()).await {
+                    Ok(dep) => (
+                        dep.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0),
+                        dep.status.and_then(|s| s.ready_replicas).unwrap_or(0),
+                    ),
+                    Err(_) => (0, 0),
+                }
+            };
 
         let jobs_api: Api<Job> = Api::namespaced(client.clone(), ns);
 
@@ -1870,6 +1873,20 @@ pub async fn scale_deployment(client: &Client, name: &str, ns: &str, replicas: i
             &Patch::Merge(&patch),
         )
         .await?;
+    Ok(())
+}
+
+pub async fn scale_serving_deployments(
+    client: &Client,
+    instance: &OdooInstance,
+    ns: &str,
+    web_replicas: i32,
+    cron_replicas: i32,
+) -> Result<()> {
+    scale_deployment(client, &instance.name_any(), ns, web_replicas).await?;
+    if instance.spec.workload_layout == WorkloadLayout::Separate {
+        scale_deployment(client, &cron_depl_name(instance), ns, cron_replicas).await?;
+    }
     Ok(())
 }
 

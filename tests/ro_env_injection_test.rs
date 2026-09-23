@@ -25,6 +25,7 @@ fn make_instance(name: &str, ro: Option<ReadOnlySqlAccessSpec>) -> OdooInstance 
             admin_password: Some("admin".to_string()),
             admin_password_secret_ref: None,
             replicas: 1,
+            workload_layout: Default::default(),
             cron: CronSpec::default(),
             ingress: IngressSpec {
                 hosts: vec!["test.example.com".to_string()],

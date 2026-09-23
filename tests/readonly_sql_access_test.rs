@@ -22,6 +22,7 @@ fn make_instance_with_ro(ro_enabled: bool, connection_limit: i32) -> OdooInstanc
             admin_password: Some("admin".to_string()),
             admin_password_secret_ref: None,
             replicas: 1,
+            workload_layout: Default::default(),
             cron: CronSpec::default(),
             ingress: IngressSpec {
                 hosts: vec!["rwi2.example.com".to_string()],
@@ -76,6 +77,7 @@ fn make_instance_no_ro() -> OdooInstance {
             admin_password: Some("admin".to_string()),
             admin_password_secret_ref: None,
             replicas: 1,
+            workload_layout: Default::default(),
             cron: CronSpec::default(),
             ingress: IngressSpec {
                 hosts: vec!["basic.example.com".to_string()],

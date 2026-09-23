@@ -18,10 +18,10 @@ use crate::error::Result;
 use crate::postgres::PostgresClusterConfig;
 
 use super::super::helpers::{
-    cron_depl_name, env, image_pull_secrets, odoo_security_context, pg_tools_image, FIELD_MANAGER,
+    env, image_pull_secrets, odoo_security_context, pg_tools_image, FIELD_MANAGER,
 };
 use super::super::odoo_instance::{load_postgres_cluster_by_name, Context};
-use super::super::state_machine::{scale_deployment, ReconcileSnapshot};
+use super::super::state_machine::{scale_serving_deployments, ReconcileSnapshot};
 use super::State;
 
 const MIGRATE_SCRIPT: &str = include_str!("../../../scripts/migrate-database.sh");
@@ -37,12 +37,10 @@ impl State for MigratingDatabase {
         _snapshot: &ReconcileSnapshot,
     ) -> Result<()> {
         let ns = instance.namespace().unwrap_or_default();
-        let inst_name = instance.name_any();
         let client = &ctx.client;
 
         // Keep both deployments at 0 during migration.
-        scale_deployment(client, &inst_name, &ns, 0).await?;
-        scale_deployment(client, &cron_depl_name(instance), &ns, 0).await?;
+        scale_serving_deployments(client, instance, &ns, 0, 0).await?;
 
         Ok(())
     }
@@ -56,8 +54,7 @@ pub async fn begin_database_migration(instance: &OdooInstance, ctx: &Context) ->
     let client = &ctx.client;
 
     // Scale down both deployments.
-    scale_deployment(client, &inst_name, &ns, 0).await?;
-    scale_deployment(client, &cron_depl_name(instance), &ns, 0).await?;
+    scale_serving_deployments(client, instance, &ns, 0, 0).await?;
 
     // Load old cluster config (from status.activeCluster).
     let old_cluster_name = instance
