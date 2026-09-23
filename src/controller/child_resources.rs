@@ -892,7 +892,17 @@ fn cron_container(name: &str, image: &str, instance: &OdooInstance) -> Container
                 initial_delay_seconds: Some(5),
                 period_seconds: Some(10),
                 timeout_seconds: Some(5),
-                failure_threshold: Some(30),
+                // Combined source-backed cron runs under a small CPU cap; extraction
+                // must finish before the trusted probe can observe the Odoo process.
+                failure_threshold: Some(
+                    if instance.spec.workload_layout == WorkloadLayout::Combined
+                        && instance.spec.source_volume.is_some()
+                    {
+                        60
+                    } else {
+                        30
+                    },
+                ),
                 exec: Some(ExecAction {
                     command: Some(startup_cmd),
                 }),
@@ -1580,5 +1590,53 @@ pub async fn delete_readonly_role(
     {
         Ok(_) | Err(kube::Error::Api(kube::core::ErrorResponse { code: 404, .. })) => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_combined_source_cron_gets_a_longer_trusted_startup_probe() {
+        for (layout, sourced, failures) in [
+            ("combined", true, 60),
+            ("separate", true, 30),
+            ("combined", false, 30),
+            ("separate", false, 30),
+        ] {
+            let mut value = serde_json::json!({
+                "apiVersion": "bemade.org/v1alpha1", "kind": "OdooInstance",
+                "metadata": {"name": "test"},
+                "spec": {"adminPassword": "test", "ingress": {"hosts": ["test.invalid"]},
+                         "workloadLayout": layout}
+            });
+            if sourced {
+                value["spec"]["sourceVolume"] = serde_json::json!({
+                    "claimName": "test-src-artifacts",
+                    "mounts": [{"mountPath": "/source-artifacts", "readOnly": true}],
+                    "odooBin": "/usr/local/bin/dsh-source-artifact-bootstrap"
+                });
+            }
+            let instance: OdooInstance = serde_json::from_value(value).unwrap();
+            let cron = cron_container("test", "odoo", &instance);
+            let startup = cron.startup_probe.unwrap();
+            assert_eq!(startup.failure_threshold, Some(failures));
+            assert_eq!(startup.period_seconds, Some(10));
+            assert_eq!(startup.timeout_seconds, Some(5));
+            assert_eq!(startup.initial_delay_seconds, Some(5));
+            assert_eq!(
+                startup.exec.unwrap().command.unwrap(),
+                [
+                    "/usr/bin/python3",
+                    "-I",
+                    "-S",
+                    "/usr/local/bin/dsh-cron-probe",
+                    "startup"
+                ]
+            );
+            assert_eq!(cron.liveness_probe.unwrap().failure_threshold, Some(3));
+            assert!(cron.readiness_probe.is_none());
+        }
     }
 }
