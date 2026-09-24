@@ -71,6 +71,11 @@ rules:
     resources: ["clusters"]
     verbs: ["get", "list", "watch", "patch"]
 
+  # Warm staging observes native HTTP activity; KEDA owns scaling and status.
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list", "watch"]
+
   # PersistentVolumes (for filestore StorageClass migration rebind)
   - apiGroups: [""]
     resources: ["persistentvolumes"]

@@ -156,6 +156,30 @@ the instance and CNPG; the operator rechecks intent around awaited work, uses
 UID/resourceVersion preconditions, and immediately requests wake if demand races
 hibernation. Instances without `stagingSleep` retain their existing behavior.
 
+Set optional `spec.stagingSleep.mode: warm` to retain prepared web and PostgreSQL
+while retiring only cron after five minutes without HTTP activity. Omitted mode
+and explicit `hibernate` preserve the zero-Pod policy above. Warm mode requires
+`workloadLayout: separate`; container resources and the CR's actual web replica
+meaning are unchanged. The platform creates an exact OdooInstance-owned KEDA
+ScaledObject named `<instance>-sleep` with min/max replicas both one. The operator
+observes its Ready/Active conditions and `lastActiveTime`; before the first request,
+its creation timestamp starts the initial cooldown. Unknown/error activity keeps
+cron available. Cron startup never gates the retained web Service's readiness.
+
+Warm web and cron use symmetric required same-node Pod affinity, preserving all
+existing placement constraints. Native self-affinity permits the first Pod when
+both are absent; replacements stay with a surviving peer. A failed peer node can
+delay replacement until normal eviction. When migrating an existing combined
+instance, the platform must author this affinity while stopped, start the separate
+workloads and prove readiness, then change the sleep mode while holding maintenance.
+Maintenance, true replicas zero, deletion and disruptive lifecycle states retain
+their existing stop/readiness fences; HTTP activity cannot override them.
+
+Install KEDA before starting the operator for warm mode. A missing ScaledObject
+API disables only that optional watch at startup, keeping installations without
+KEDA unchanged. Restart the operator after installing KEDA later. Other discovery
+errors remain visible through the normal watch error path.
+
 ### Production HTTP monitoring
 
 The hosting platform supplies the server-wide Odoo instrumentation addon and the

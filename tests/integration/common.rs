@@ -49,10 +49,9 @@ static NS_COUNTER: AtomicU32 = AtomicU32::new(0);
 // Shared environment (one envtest server + controller per test binary)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Holds the envtest server, a kube Client, and the tokio runtime that drives
-/// the controller.  All three live for the entire process.
+/// Holds envtest configuration and the runtime driving the controller.
 struct SharedEnv {
-    client: Client,
+    config: Config,
     // The runtime keeps the controller task and kube HTTP connections alive
     // across individual `#[tokio::test]` runtimes.
     _runtime: tokio::runtime::Runtime,
@@ -77,7 +76,7 @@ fn init_shared() -> SharedEnv {
         .build()
         .expect("failed to build shared runtime");
 
-    let (client, server) = rt.block_on(async {
+    let (client, config, server) = rt.block_on(async {
         let mut env = Environment::default();
         let env = env
             .with_crds({
@@ -144,7 +143,7 @@ fn init_shared() -> SharedEnv {
         let config = Config::from_custom_kubeconfig(kubeconfig, &KubeConfigOptions::default())
             .await
             .expect("failed to build config");
-        let client = Client::try_from(config).expect("failed to create client");
+        let client = Client::try_from(config.clone()).expect("failed to create client");
 
         // Create the postgres-clusters secret in the operator namespace ("default").
         let secrets: Api<Secret> = Api::namespaced(client.clone(), "default");
@@ -170,7 +169,7 @@ fn init_shared() -> SharedEnv {
             .await
             .expect("failed to create postgres-clusters secret");
 
-        (client, server)
+        (client, config, server)
     });
 
     // Spawn the controller on the shared runtime so it outlives test runtimes.
@@ -180,7 +179,7 @@ fn init_shared() -> SharedEnv {
     });
 
     SharedEnv {
-        client,
+        config,
         _runtime: rt,
         _server: server,
     }
@@ -219,7 +218,9 @@ impl TestContext {
     /// Use this when you need to create the instance with custom fields.
     pub async fn new_ns() -> Self {
         let env = shared();
-        let client = env.client.clone();
+        // A hyper connection belongs to the runtime that first uses it. Never
+        // share its pool with another short-lived #[tokio::test] runtime.
+        let client = Client::try_from(env.config.clone()).expect("failed to create test client");
 
         let id = NS_COUNTER.fetch_add(1, Ordering::SeqCst);
         let ns = format!("test-{id}");
@@ -242,7 +243,7 @@ impl TestContext {
     /// Create a new test context with a custom replica count.
     pub async fn new_with_replicas(instance_name: &str, replicas: i32) -> Self {
         let env = shared();
-        let client = env.client.clone();
+        let client = Client::try_from(env.config.clone()).expect("failed to create test client");
 
         // Unique namespace per test.
         let id = NS_COUNTER.fetch_add(1, Ordering::SeqCst);

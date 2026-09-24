@@ -30,7 +30,7 @@ impl State for Running {
         }
 
         if instance.spec.workload_layout == WorkloadLayout::Separate {
-            let desired = instance.spec.cron.replicas;
+            let desired = crate::controller::staging_sleep::cron_replicas(instance, snap);
             let cron_depl_name = cron_depl_name(instance);
             info!(
                 desired = desired,
@@ -39,7 +39,20 @@ impl State for Running {
             );
             if snap.cron_deployment_replicas != desired {
                 info!(%cron_depl_name, from = snap.cron_deployment_replicas, to = desired, "scaling cron deployment");
-                scale_deployment(&ctx.client, cron_depl_name.as_str(), ns, desired).await?;
+                if crate::controller::staging_sleep::is_warm(instance) {
+                    crate::controller::staging_sleep::scale_warm_cron(
+                        &ctx.client,
+                        instance,
+                        desired,
+                        crate::controller::staging_sleep::cron_can_run(instance, snap)
+                            && snap
+                                .warm_cron
+                                .is_some_and(|decision| decision.replicas == 0),
+                    )
+                    .await?;
+                } else {
+                    scale_deployment(&ctx.client, cron_depl_name.as_str(), ns, desired).await?;
+                }
             }
         }
         Ok(())

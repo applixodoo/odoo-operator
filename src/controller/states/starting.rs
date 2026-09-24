@@ -36,8 +36,28 @@ impl State for Starting {
         // the Starting → Stopped transition (guard `replicas == 0`), so a floor
         // here would only transiently override an external autoscaler.
         let replicas = instance.spec.replicas;
-        let cron_replicas = instance.spec.cron.replicas;
-        scale_serving_deployments(&ctx.client, instance, &ns, replicas, cron_replicas).await?;
+        let cron_replicas = crate::controller::staging_sleep::cron_replicas(instance, snap);
+        if crate::controller::staging_sleep::is_warm(instance) {
+            crate::controller::state_machine::scale_deployment(
+                &ctx.client,
+                &instance.name_any(),
+                &ns,
+                replicas,
+            )
+            .await?;
+            crate::controller::staging_sleep::scale_warm_cron(
+                &ctx.client,
+                instance,
+                cron_replicas,
+                crate::controller::staging_sleep::cron_can_run(instance, snap)
+                    && snap
+                        .warm_cron
+                        .is_some_and(|decision| decision.replicas == 0),
+            )
+            .await?;
+        } else {
+            scale_serving_deployments(&ctx.client, instance, &ns, replicas, cron_replicas).await?;
+        }
 
         if !snap.stuck_mount_pods.is_empty() {
             recover_stuck_mounts(&ctx.client, &ns, &snap.stuck_mount_pods).await;

@@ -758,6 +758,7 @@ mod tests {
             let old = req.old_object.as_mut().unwrap();
             old.spec.staging_sleep = Some(crate::crd::odoo_instance::StagingSleepSpec {
                 database_cluster: "db".into(),
+                mode: Default::default(),
             });
             old.status.as_mut().unwrap().ready = ready;
             req.object.as_mut().unwrap().spec.workload_layout = old.spec.workload_layout;
@@ -772,6 +773,7 @@ mod tests {
         new.spec.environment = crate::crd::odoo_instance::Environment::Production;
         new.spec.staging_sleep = Some(crate::crd::odoo_instance::StagingSleepSpec {
             database_cluster: "db".into(),
+            mode: Default::default(),
         });
         new.spec.database =
             Some(serde_json::from_value(serde_json::json!({"cluster": "db"})).unwrap());

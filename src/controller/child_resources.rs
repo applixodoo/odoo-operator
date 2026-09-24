@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::{
     apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy},
     core::v1::{
-        ConfigMap, Container, ContainerPort, EnvVar, ExecAction, HTTPGetAction,
-        PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe,
-        Secret, Service, ServicePort, ServiceSpec, TypedObjectReference,
+        Affinity, ConfigMap, Container, ContainerPort, EnvVar, ExecAction, HTTPGetAction,
+        PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodAffinityTerm, PodSpec,
+        PodTemplateSpec, Probe, Secret, Service, ServicePort, ServiceSpec, TypedObjectReference,
         VolumeResourceRequirements,
     },
     networking::v1::{
@@ -21,7 +21,7 @@ use k8s_openapi::api::{
 };
 use k8s_openapi::apimachinery::pkg::{
     api::resource::Quantity,
-    apis::meta::v1::{LabelSelector, OwnerReference},
+    apis::meta::v1::{LabelSelector, LabelSelectorRequirement, OwnerReference},
     util::intstr::IntOrString,
 };
 use k8s_openapi::ByteString;
@@ -1033,7 +1033,7 @@ pub async fn ensure_deployment(
                 }),
                 spec: Some(PodSpec {
                     image_pull_secrets: image_pull_secrets(instance),
-                    affinity: instance.spec.affinity.clone(),
+                    affinity: serving_affinity(instance),
                     tolerations: if instance.spec.tolerations.is_empty() {
                         None
                     } else {
@@ -1236,6 +1236,45 @@ pub async fn ensure_routing(
     Ok(())
 }
 
+fn serving_affinity(instance: &OdooInstance) -> Option<Affinity> {
+    let mut affinity = instance.spec.affinity.clone();
+    if super::staging_sleep::is_warm(instance) {
+        let mut labels = BTreeMap::new();
+        for key in ["droggol.sh/server-id", "droggol.sh/instance-id"] {
+            if let Some(value) = instance.labels().get(key) {
+                labels.insert(key.to_string(), value.clone());
+            }
+        }
+        // Both templates match this term themselves, so native self-affinity
+        // permits the first Pod and keeps replacements with a surviving peer.
+        // The agent can author this same term before a stopped layout change;
+        // adding warm mode later must not trigger another template rollout.
+        let term = PodAffinityTerm {
+            label_selector: Some(LabelSelector {
+                match_labels: Some(labels),
+                match_expressions: Some(vec![LabelSelectorRequirement {
+                    key: "app".to_string(),
+                    operator: "In".to_string(),
+                    values: Some(vec![instance.name_any(), cron_depl_name(instance)]),
+                }]),
+            }),
+            namespaces: Some(vec![instance.namespace().unwrap_or_default()]),
+            topology_key: "kubernetes.io/hostname".to_string(),
+            ..Default::default()
+        };
+        let terms = affinity
+            .get_or_insert_with(Default::default)
+            .pod_affinity
+            .get_or_insert_with(Default::default)
+            .required_during_scheduling_ignored_during_execution
+            .get_or_insert_with(Vec::new);
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    affinity
+}
+
 pub async fn ensure_cron_deployment(
     client: &Client,
     ns: &str,
@@ -1308,7 +1347,7 @@ pub async fn ensure_cron_deployment(
                 }),
                 spec: Some(PodSpec {
                     image_pull_secrets: image_pull_secrets(instance),
-                    affinity: instance.spec.affinity.clone(),
+                    affinity: serving_affinity(instance),
                     tolerations: if instance.spec.tolerations.is_empty() {
                         None
                     } else {
@@ -1596,6 +1635,70 @@ pub async fn delete_readonly_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_symmetric_affinity_preserves_existing_constraints_and_deduplicates() {
+        let mut instance: OdooInstance = serde_json::from_value(json!({
+            "apiVersion": "bemade.org/v1alpha1", "kind": "OdooInstance",
+            "metadata": {"name": "odoo", "namespace": "tenant", "labels": {
+                "droggol.sh/server-id": "server", "droggol.sh/instance-id": "instance"}},
+            "spec": {"adminPassword": "test", "ingress": {"hosts": ["test.invalid"]},
+                "affinity": {
+                    "nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [{"key": "tier", "operator": "In", "values": ["normal"]}]}]}},
+                    "podAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [{"weight": 1, "podAffinityTerm": {"topologyKey": "kubernetes.io/hostname", "labelSelector": {"matchLabels": {"app": "database"}}}}]}
+                },
+                "stagingSleep": {"databaseCluster": "db", "mode": "warm"}}
+        })).unwrap();
+        let original = instance.spec.affinity.clone().unwrap();
+        let warm = serving_affinity(&instance).unwrap();
+        assert_eq!(warm.node_affinity, original.node_affinity);
+        assert_eq!(warm.pod_anti_affinity, original.pod_anti_affinity);
+        assert_eq!(
+            warm.pod_affinity
+                .as_ref()
+                .unwrap()
+                .preferred_during_scheduling_ignored_during_execution,
+            original
+                .pod_affinity
+                .as_ref()
+                .unwrap()
+                .preferred_during_scheduling_ignored_during_execution
+        );
+        let terms = warm
+            .pod_affinity
+            .as_ref()
+            .unwrap()
+            .required_during_scheduling_ignored_during_execution
+            .as_ref()
+            .unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].topology_key, "kubernetes.io/hostname");
+        assert_eq!(
+            terms[0].namespaces.as_ref().unwrap(),
+            &vec!["tenant".to_string()]
+        );
+        let selector = terms[0].label_selector.as_ref().unwrap();
+        assert_eq!(
+            selector.match_labels.as_ref().unwrap()["droggol.sh/instance-id"],
+            "instance"
+        );
+        assert_eq!(
+            selector.match_labels.as_ref().unwrap()["droggol.sh/server-id"],
+            "server"
+        );
+        assert_eq!(
+            selector.match_expressions.as_ref().unwrap()[0]
+                .values
+                .as_ref()
+                .unwrap(),
+            &vec!["odoo".to_string(), "odoo-cron".to_string()]
+        );
+        instance.spec.affinity = Some(warm.clone());
+        assert_eq!(serving_affinity(&instance), Some(warm));
+        instance.spec.affinity = Some(original.clone());
+        instance.spec.staging_sleep.as_mut().unwrap().mode = None;
+        assert_eq!(serving_affinity(&instance), Some(original));
+    }
 
     #[test]
     fn only_combined_source_cron_gets_a_longer_trusted_startup_probe() {

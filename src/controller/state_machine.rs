@@ -77,6 +77,7 @@ pub struct ReconcileSnapshot {
     pub deployment_replicas: i32,
     pub cron_ready_replicas: i32,
     pub cron_deployment_replicas: i32,
+    pub warm_cron: Option<super::staging_sleep::WarmCron>,
     pub db_initialized: bool,
 
     // ── Job CR status (combines presence + K8s Job outcome) ──────────────
@@ -523,6 +524,7 @@ impl ReconcileSnapshot {
             deployment_replicas,
             cron_ready_replicas,
             cron_deployment_replicas,
+            warm_cron: super::staging_sleep::warm_cron(client, instance).await,
             db_initialized: db_init_from_jobs,
             init_job,
             restore_job,
@@ -1743,6 +1745,20 @@ pub async fn run_state_machine(
     // 1. State outputs — idempotent, corrects drift.
     let state = super::states::state_for(&phase);
     state.ensure(instance, ctx, snapshot).await?;
+    // These non-disruptive states normally preserve Deployment counts. Warm
+    // staging must still retire idle cron, without changing web readiness.
+    if super::staging_sleep::is_warm(instance) && matches!(phase, Degraded | BackingUp) {
+        super::staging_sleep::scale_warm_cron(
+            &ctx.client,
+            instance,
+            super::staging_sleep::cron_replicas(instance, snapshot),
+            super::staging_sleep::cron_can_run(instance, snapshot)
+                && snapshot
+                    .warm_cron
+                    .is_some_and(|decision| decision.replicas == 0),
+        )
+        .await?;
+    }
 
     // 2. Evaluate transitions — first matching guard wins.
     for t in TRANSITIONS.iter().filter(|t| t.from == phase) {
@@ -1794,18 +1810,24 @@ pub const EXTERNAL_SECRET_POLL: Duration = Duration::from_secs(600);
 /// A bounded requeue bounds that staleness. Instances using neither feature
 /// keep `await_change()` exactly as before, so no-new-fields behaviour is
 /// unchanged and idle clusters stay idle.
-fn requeue_for(
+pub(crate) fn requeue_for(
     phase: &OdooInstancePhase,
     snapshot: &ReconcileSnapshot,
     poll_external_secrets: bool,
 ) -> Action {
     // If an upgrade job exists but its scheduled time hasn't arrived yet,
     // requeue so we wake up when it's due.
-    if let Some(requeue) = scheduled_requeue(snapshot) {
-        return requeue;
-    }
-
-    match steady_requeue_interval(phase, poll_external_secrets) {
+    match [
+        scheduled_requeue(snapshot),
+        steady_requeue_interval(phase, poll_external_secrets),
+        snapshot
+            .warm_cron
+            .and_then(|decision| decision.requeue_after),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    {
         Some(d) => Action::requeue(d),
         None => Action::await_change(),
     }
@@ -1839,7 +1861,7 @@ pub(crate) fn steady_requeue_interval(
 
 /// If an upgrade job CR is present but its `scheduledTime` is in the future,
 /// return a requeue action that fires when the time arrives.
-fn scheduled_requeue(snapshot: &ReconcileSnapshot) -> Option<Action> {
+fn scheduled_requeue(snapshot: &ReconcileSnapshot) -> Option<Duration> {
     if !snapshot.upgrade_job.is_present() {
         return None;
     }
@@ -1856,7 +1878,7 @@ fn scheduled_requeue(snapshot: &ReconcileSnapshot) -> Option<Action> {
     let delay = (target.with_timezone(&chrono::Utc) - now)
         .to_std()
         .unwrap_or(Duration::from_secs(10));
-    Some(Action::requeue(delay))
+    Some(delay)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1885,7 +1907,11 @@ pub async fn scale_serving_deployments(
 ) -> Result<()> {
     scale_deployment(client, &instance.name_any(), ns, web_replicas).await?;
     if instance.spec.workload_layout == WorkloadLayout::Separate {
-        scale_deployment(client, &cron_depl_name(instance), ns, cron_replicas).await?;
+        if super::staging_sleep::is_warm(instance) {
+            super::staging_sleep::scale_warm_cron(client, instance, cron_replicas, false).await?;
+        } else {
+            scale_deployment(client, &cron_depl_name(instance), ns, cron_replicas).await?;
+        }
     }
     Ok(())
 }
