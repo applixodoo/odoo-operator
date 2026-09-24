@@ -17,7 +17,7 @@ use k8s_openapi::api::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::{
-    api::{Api, Patch, PatchParams, ResourceExt},
+    api::{Api, DynamicObject, ListParams, Patch, PatchParams, ResourceExt},
     runtime::{
         controller::{Action, Controller},
         events::{Event as KubeEvent, EventType, Recorder, Reporter},
@@ -122,14 +122,26 @@ pub async fn run(ctx: Arc<Context>) {
     let restore_jobs: Api<OdooRestoreJob> = Api::all(client.clone());
     let refresh_jobs: Api<OdooStagingRefreshJob> = Api::all(client.clone());
     let backup_jobs: Api<OdooBackupJob> = Api::all(client.clone());
+    let scaler_resource = super::staging_sleep::scaler_resource();
+    let scalers: Api<DynamicObject> = Api::all_with(client.clone(), &scaler_resource);
 
-    Controller::new(instances, WatcherConfig::default())
+    let controller = Controller::new(instances, WatcherConfig::default())
         .owns(deployments, WatcherConfig::default())
         .owns(services, WatcherConfig::default())
         .owns(ingresses, WatcherConfig::default())
         .owns(configmaps, WatcherConfig::default())
         .owns(secrets, WatcherConfig::default())
-        .owns(pvcs, WatcherConfig::default())
+        .owns(pvcs, WatcherConfig::default());
+    // KEDA is optional for installations with no warm staging. A missing API
+    // must not put every Odoo watch into the controller's shared error backoff.
+    // Install KEDA before starting the operator, or restart after installing it.
+    let controller = if scaler_api_installed(&scalers).await {
+        controller.owns_with(scalers, scaler_resource, WatcherConfig::default())
+    } else {
+        info!("KEDA is not installed; warm staging requires an operator restart after KEDA installation");
+        controller
+    };
+    controller
         // Watch job CRDs and map back to the owning OdooInstance.
         .watches(
             init_jobs,
@@ -171,6 +183,47 @@ pub async fn run(ctx: Arc<Context>) {
             }
         })
         .await;
+}
+
+async fn scaler_api_installed(api: &Api<DynamicObject>) -> bool {
+    // Only 404 means absent. RBAC/transport/server errors must remain visible
+    // through the normal watch error path, rather than silently disabling it.
+    !matches!(api.list(&ListParams::default().limit(1)).await,
+        Err(kube::Error::Api(error)) if error.code == 404)
+}
+
+#[cfg(test)]
+mod optional_keda_tests {
+    use super::*;
+    use http::{Request, Response};
+    use kube::client::Body;
+    use tower_test::mock;
+
+    #[tokio::test]
+    async fn only_a_missing_keda_api_disables_its_optional_watch() {
+        for code in [200, 403, 404, 500] {
+            let (service, mut handle) = mock::pair::<Request<Body>, Response<Body>>();
+            let response = tokio::spawn(async move {
+                let (request, send) = handle.next_request().await.unwrap();
+                assert_eq!(request.uri().path(), "/apis/keda.sh/v1alpha1/scaledobjects");
+                let body = if code == 200 {
+                    json!({"apiVersion": "keda.sh/v1alpha1", "kind": "ScaledObjectList", "metadata": {}, "items": []})
+                } else {
+                    json!({"apiVersion": "v1", "kind": "Status", "status": "Failure", "reason": "test", "message": "test", "code": code})
+                };
+                send.send_response(
+                    Response::builder()
+                        .status(code)
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                );
+            });
+            let client = Client::new(service, "tenant");
+            let api = Api::all_with(client, &super::super::staging_sleep::scaler_resource());
+            assert_eq!(scaler_api_installed(&api).await, code != 404, "{code}");
+            response.await.unwrap();
+        }
+    }
 }
 
 // ── Watch mappers (job → instance) ────────────────────────────────────────────

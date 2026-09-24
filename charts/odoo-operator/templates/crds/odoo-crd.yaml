@@ -1088,6 +1088,13 @@ spec:
                 properties:
                   databaseCluster:
                     type: string
+                  mode:
+                    description: Whether HTTP inactivity removes runtime Pods or retains the prepared web/database.
+                    enum:
+                    - hibernate
+                    - warm
+                    nullable: true
+                    type: string
                 required:
                 - databaseCluster
                 type: object
@@ -1160,6 +1167,8 @@ spec:
               rule: self.environment != 'Production' || !has(self.productionInstanceRef)
             - messageExpression: '''stagingSleep requires the same explicit database.cluster'''
               rule: '!has(self.stagingSleep) || (has(self.database) && has(self.database.cluster) && self.stagingSleep.databaseCluster == self.database.cluster && size(self.stagingSleep.databaseCluster) > 0)'
+            - messageExpression: '''warm staging requires separate web and cron workloads'''
+              rule: '!has(self.stagingSleep) || !has(self.stagingSleep.mode) || self.stagingSleep.mode != ''warm'' || !has(self.workloadLayout) || self.workloadLayout == ''separate'''
             - messageExpression: '''exactly one of spec.adminPassword and spec.adminPasswordSecretRef must be set'''
               rule: has(self.adminPassword) != has(self.adminPasswordSecretRef)
             - messageExpression: '''spec.sourceVolume.mounts must not be empty'''

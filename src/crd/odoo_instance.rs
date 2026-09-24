@@ -454,11 +454,22 @@ fn default_init_modules() -> Vec<String> {
     vec!["base".to_string()]
 }
 
-/// Opt in to sleeping this staging instance's dedicated, same-namespace CNPG cluster.
+/// Whether HTTP inactivity removes runtime Pods or retains the prepared web/database.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum StagingSleepMode {
+    #[default]
+    Hibernate,
+    Warm,
+}
+
+/// Opt in to HTTP-driven idle handling of a dedicated staging database.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StagingSleepSpec {
     pub database_cluster: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<StagingSleepMode>,
 }
 
 // ── CRD ───────────────────────────────────────────────────────────────────────
@@ -473,6 +484,10 @@ pub struct StagingSleepSpec {
     rule = Rule::new("!has(self.stagingSleep) || (has(self.database) && has(self.database.cluster) && self.stagingSleep.databaseCluster == self.database.cluster && size(self.stagingSleep.databaseCluster) > 0)")
         .message(Message::Expression(
             "'stagingSleep requires the same explicit database.cluster'".into()
+        )),
+    rule = Rule::new("!has(self.stagingSleep) || !has(self.stagingSleep.mode) || self.stagingSleep.mode != 'warm' || !has(self.workloadLayout) || self.workloadLayout == 'separate'")
+        .message(Message::Expression(
+            "'warm staging requires separate web and cron workloads'".into()
         )),
     // Exactly one of the two master-password sources. `adminPassword` used to
     // be a required field, so "neither" was unrepresentable and "both" did not

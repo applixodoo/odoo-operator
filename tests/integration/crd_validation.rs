@@ -297,3 +297,24 @@ async fn staging_sleep_requires_matching_explicit_database_cluster() {
         );
     }
 }
+
+#[tokio::test]
+async fn warm_staging_requires_separate_layout_at_api_admission() {
+    let ctx = TestContext::new_ns().await;
+    for (name, layout, accepted) in [
+        ("warm-separate", "separate", true),
+        ("warm-combined", "combined", false),
+    ] {
+        let body = instance_with_spec(name, &ctx.ns, |spec| {
+            spec["environment"] = json!("Production");
+            spec["database"] = json!({"cluster": "db"});
+            spec["stagingSleep"] = json!({"databaseCluster": "db", "mode": "warm"});
+            spec["workloadLayout"] = json!(layout);
+        });
+        assert_eq!(
+            try_create(&ctx.client, &ctx.ns, body).await.is_ok(),
+            accepted,
+            "{name}"
+        );
+    }
+}
