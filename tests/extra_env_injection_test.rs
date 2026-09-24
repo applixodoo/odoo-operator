@@ -52,6 +52,7 @@ fn make_instance(extra_env: Vec<EnvVar>, extra_env_from: Vec<EnvFromSource>) -> 
             init: Default::default(),
             environment: Default::default(),
             production_instance_ref: None,
+            staging_sleep: None,
             strategy: None,
             webhook: None,
             probes: None,

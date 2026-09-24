@@ -274,3 +274,26 @@ async fn source_volume_with_a_relative_mount_path_is_rejected() {
         "unexpected rejection message: {err}"
     );
 }
+
+#[tokio::test]
+async fn staging_sleep_requires_matching_explicit_database_cluster() {
+    let ctx = TestContext::new_ns().await;
+    for (name, database, accepted) in [
+        ("sleep-valid", Some("db"), true),
+        ("sleep-other", Some("other"), false),
+        ("sleep-implicit", None, false),
+    ] {
+        let body = instance_with_spec(name, &ctx.ns, |spec| {
+            spec["environment"] = json!("Production");
+            spec["stagingSleep"] = json!({"databaseCluster": "db"});
+            if let Some(database) = database {
+                spec["database"] = json!({"cluster": database});
+            }
+        });
+        assert_eq!(
+            try_create(&ctx.client, &ctx.ns, body).await.is_ok(),
+            accepted,
+            "{name}"
+        );
+    }
+}

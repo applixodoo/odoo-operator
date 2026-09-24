@@ -454,6 +454,13 @@ fn default_init_modules() -> Vec<String> {
     vec!["base".to_string()]
 }
 
+/// Opt in to sleeping this staging instance's dedicated, same-namespace CNPG cluster.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StagingSleepSpec {
+    pub database_cluster: String,
+}
+
 // ── CRD ───────────────────────────────────────────────────────────────────────
 
 /// OdooInstance is the Schema for the odooinstances API.
@@ -462,6 +469,10 @@ fn default_init_modules() -> Vec<String> {
     rule = Rule::new("self.environment != 'Production' || !has(self.productionInstanceRef)")
         .message(Message::Expression(
             "'spec.productionInstanceRef is forbidden on production instances'".into()
+        )),
+    rule = Rule::new("!has(self.stagingSleep) || (has(self.database) && has(self.database.cluster) && self.stagingSleep.databaseCluster == self.database.cluster && size(self.stagingSleep.databaseCluster) > 0)")
+        .message(Message::Expression(
+            "'stagingSleep requires the same explicit database.cluster'".into()
         )),
     // Exactly one of the two master-password sources. `adminPassword` used to
     // be a required field, so "neither" was unrepresentable and "both" did not
@@ -596,6 +607,11 @@ pub struct OdooInstanceSpec {
     /// `environment: Production`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub production_instance_ref: Option<ProductionInstanceRef>,
+
+    /// Sleep the dedicated CNPG database after replicas reach zero and serving
+    /// Pods have terminated. Maintenance annotation presence keeps it awake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_sleep: Option<StagingSleepSpec>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<StrategySpec>,

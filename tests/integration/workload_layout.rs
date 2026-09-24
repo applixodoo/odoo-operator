@@ -337,3 +337,46 @@ async fn combined_retirement_refuses_a_foreign_cron_deployment() -> anyhow::Resu
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn combined_staging_without_monitoring_has_only_web_and_cron() -> anyhow::Result<()> {
+    let ctx = TestContext::new_ns().await;
+    let name = "combined-staging-no-exporter";
+    let mut body = test_instance_json(name, &ctx.ns, 1);
+    body["spec"]["workloadLayout"] = json!("combined");
+    body["spec"]["environment"] = json!("Production");
+    body["metadata"]["labels"] = json!({"droggol.sh/instance-kind": "staging"});
+    let instance: OdooInstance = serde_json::from_value(body)?;
+    let instances: Api<OdooInstance> = Api::namespaced(ctx.client.clone(), &ctx.ns);
+    instances.create(&PostParams::default(), &instance).await?;
+    let ready = fast_track_to_running(&ctx, "combined-no-exporter-init").await;
+    ready.abort();
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ctx.ns);
+    let pod = deployments
+        .get(name)
+        .await?
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap();
+    assert_eq!(
+        pod.containers
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "odoo-combined-staging-no-exporter",
+            "odoo-cron-combined-staging-no-exporter"
+        ]
+    );
+    assert!(pod.containers.iter().all(|c| !c
+        .env
+        .as_ref()
+        .is_some_and(|env| env.iter().any(|e| e.name.starts_with("DSH_MONITORING_")))));
+    assert!(deployments
+        .get_opt(&format!("{name}-cron"))
+        .await?
+        .is_none());
+    Ok(())
+}

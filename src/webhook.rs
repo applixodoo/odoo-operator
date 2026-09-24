@@ -144,6 +144,9 @@ fn validate(req: AdmissionRequest<OdooInstance>) -> AdmissionResponse {
         if let Some(msg) = admin_password_violation(new) {
             return AdmissionResponse::from(&req).deny(msg);
         }
+        if let Err(error) = crate::controller::staging_sleep::validate_spec(new) {
+            return AdmissionResponse::from(&req).deny(error.to_string());
+        }
         if let Some(msg) = workload_layout_violation(new) {
             return AdmissionResponse::from(&req).deny(msg);
         }
@@ -162,6 +165,20 @@ fn validate(req: AdmissionRequest<OdooInstance>) -> AdmissionResponse {
         Some(ref obj) => obj,
         None => return AdmissionResponse::from(&req),
     };
+
+    if old.spec.staging_sleep.is_some()
+        && old.spec.staging_sleep != new.spec.staging_sleep
+        && (old.spec.replicas <= 0
+            || new.spec.replicas <= 0
+            || !old
+                .status
+                .as_ref()
+                .is_some_and(|s| s.ready && s.phase == Some(OdooInstancePhase::Running)))
+    {
+        return AdmissionResponse::from(&req).deny(
+            "wake staging to Running with replicas > 0 before changing or removing stagingSleep",
+        );
+    }
 
     if old.spec.workload_layout != new.spec.workload_layout
         && (old.spec.replicas != 0
@@ -733,5 +750,36 @@ mod tests {
             !resp.allowed,
             "changing to a third storageClass during migration should be rejected"
         );
+    }
+    #[test]
+    fn staging_sleep_disable_requires_awake_running_instance() {
+        for (replicas, ready, allowed) in [(0, false, false), (1, false, false), (1, true, true)] {
+            let mut req = make_layout_change_request(replicas, replicas, "Running", 1);
+            let old = req.old_object.as_mut().unwrap();
+            old.spec.staging_sleep = Some(crate::crd::odoo_instance::StagingSleepSpec {
+                database_cluster: "db".into(),
+            });
+            old.status.as_mut().unwrap().ready = ready;
+            req.object.as_mut().unwrap().spec.workload_layout = old.spec.workload_layout;
+            assert_eq!(validate(req).allowed, allowed);
+        }
+    }
+
+    #[test]
+    fn staging_sleep_requires_platform_staging_identity_not_odoo_environment() {
+        let mut req = make_update_request(None, None, None, None);
+        let new = req.object.as_mut().unwrap();
+        new.spec.environment = crate::crd::odoo_instance::Environment::Production;
+        new.spec.staging_sleep = Some(crate::crd::odoo_instance::StagingSleepSpec {
+            database_cluster: "db".into(),
+        });
+        new.spec.database =
+            Some(serde_json::from_value(serde_json::json!({"cluster": "db"})).unwrap());
+        assert!(!validate(req.clone()).allowed);
+        req.object.as_mut().unwrap().metadata.labels = Some(std::collections::BTreeMap::from([(
+            "droggol.sh/instance-kind".into(),
+            "staging".into(),
+        )]));
+        assert!(validate(req).allowed);
     }
 }
