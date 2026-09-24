@@ -2,6 +2,28 @@ apiVersion: v1
 entries:
   odoo-operator:
   - apiVersion: v2
+    appVersion: 2.7.0-droggol.8
+    created: "2026-09-24T04:11:05.172545941Z"
+    description: A Kubernetes operator for managing Odoo instances
+    digest: e155558d3af5470ce4027471db8551a34efe2a3d715a626346fbbca101aa9714
+    home: https://github.com/bemade/odoo-operator
+    keywords:
+    - odoo
+    - operator
+    - kubernetes
+    - bemade
+    maintainers:
+    - email: marc@bemade.org
+      name: Bemade Inc.
+      url: https://bemade.org
+    name: odoo-operator
+    sources:
+    - https://github.com/bemade/odoo-operator
+    type: application
+    urls:
+    - https://github.com/applixodoo/odoo-operator/releases/download/odoo-operator-2.7.0-droggol.8/odoo-operator-2.7.0-droggol.8.tgz
+    version: 2.7.0-droggol.8
+  - apiVersion: v2
     appVersion: 2.7.0-droggol.7
     created: "2026-09-23T04:13:34.503563772Z"
     description: A Kubernetes operator for managing Odoo instances
@@ -155,4 +177,4 @@ entries:
     urls:
     - https://github.com/applixodoo/odoo-operator/releases/download/odoo-operator-2.7.0-droggol.1/odoo-operator-2.7.0-droggol.1.tgz
     version: 2.7.0-droggol.1
-generated: "2026-09-23T04:13:34.503597903Z"
+generated: "2026-09-24T04:11:05.172599591Z"
