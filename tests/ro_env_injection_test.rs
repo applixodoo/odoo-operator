@@ -40,6 +40,7 @@ fn make_instance(name: &str, ro: Option<ReadOnlySqlAccessSpec>) -> OdooInstance 
             init: Default::default(),
             environment: Default::default(),
             production_instance_ref: None,
+            staging_sleep: None,
             strategy: None,
             webhook: None,
             probes: None,

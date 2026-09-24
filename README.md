@@ -125,6 +125,37 @@ module. To skip auto-init (e.g. when restoring from a backup), set
 | `monitoring.exporterImage` | disabled | Official `prom/statsd-exporter` semver image pinned by SHA-256; production web pods only |
 | `monitoring.configMapName` | — | Existing immutable, content-addressed ConfigMap containing `statsd-mapping.yml` |
 
+### Staging database sleep
+
+Opt in with `spec.stagingSleep.databaseCluster`, matching `spec.database.cluster`.
+The OdooInstance must carry `droggol.sh/instance-kind: staging`; both it and its
+same-namespace, single-primary CNPG Cluster must carry matching nonempty
+`droggol.sh/server-id` and `droggol.sh/instance-id` labels. This platform staging
+identity is independent of Odoo's `spec.environment`; existing mail/neutralization
+behavior is preserved.
+
+An external HTTP scaler owns `spec.replicas` and the inactivity timeout. At zero,
+the operator scales owned web/cron Deployments down, waits for every serving Pod
+(including terminating Pods) to disappear, then sets CNPG's native
+`cnpg.io/hibernation: on`. Only initialized normal runtime sleeps; native pending
+jobs and migrations keep the database awake. Cron activity does not change the
+HTTP scaler's decision. A positive replica target wakes CNPG and waits for its
+Ready condition and a Ready primary Pod before PostgreSQL operations or Odoo startup.
+
+Before external database maintenance, pause the HTTP scaler and set
+`droggol.sh/staging-maintenance: <job-attempt-id>` on the OdooInstance. Presence of
+this annotation wakes/keeps CNPG awake even at zero replicas. Wait for CNPG and its
+primary Pod to be Ready before running the operation; clear the annotation only
+after it finishes, then resume the scaler. Maintenance belongs to the platform,
+not to cron traffic.
+
+To disable/change this opt-in, pause the scaler, set replicas above zero and wait
+for the instance to be Running and Ready, then remove/change `stagingSleep`.
+Admission rejects removal/change while stopped. Kubernetes cannot atomically patch
+the instance and CNPG; the operator rechecks intent around awaited work, uses
+UID/resourceVersion preconditions, and immediately requests wake if demand races
+hibernation. Instances without `stagingSleep` retain their existing behavior.
+
 ### Production HTTP monitoring
 
 The hosting platform supplies the server-wide Odoo instrumentation addon and the

@@ -350,6 +350,11 @@ async fn reconcile_instance(instance: &OdooInstance, ctx: &Context) -> Result<Ac
         return Ok(Action::requeue(Duration::from_secs(0)));
     }
 
+    // CNPG must be awake before any PostgreSQL-dependent ensure or startup.
+    if let Some(action) = super::staging_sleep::reconcile(client, instance).await? {
+        return Ok(action);
+    }
+
     // Load postgres cluster config.
     let (cluster_name, pg_cluster) = load_postgres_cluster(ctx, instance).await?;
 
